@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, HTTPException, Response, status, Header
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings, authenticate_tenant, verify_admin_key, get_active_provider_info
+from app.config import settings, authenticate_tenant, verify_admin_key, get_active_provider_info, DEV_MODE
 from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo, GatewayMetricsResponse
 from app.core.rate_limiter import rate_limiter
 from app.core.semantic_cache import semantic_cache
@@ -358,6 +358,8 @@ async def interactive_playground():
             <p class="text-[10px] text-rose-400/80">fastembed missing; run 'pip install fastembed'</p>
         </div>"""
 
+    default_dev_key = "sk-aegis-tenant-alpha" if DEV_MODE else ""
+
     raw_html = """
     <!DOCTYPE html>
     <html lang="en">
@@ -621,11 +623,40 @@ async def interactive_playground():
             function escapeHtml(str) {
                 return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
             }
+
+            // Remember and auto-restore keys across browser refreshes via localStorage
+            document.addEventListener('DOMContentLoaded', () => {
+                const defaultDevKey = "__DEFAULT_DEV_KEY__";
+                const apiKeyInput = document.getElementById('api-key');
+                const savedApiKey = localStorage.getItem('aegis_tenant_api_key');
+                if (savedApiKey) {
+                    apiKeyInput.value = savedApiKey;
+                } else if (defaultDevKey) {
+                    apiKeyInput.value = defaultDevKey;
+                }
+                apiKeyInput.addEventListener('input', () => {
+                    localStorage.setItem('aegis_tenant_api_key', apiKeyInput.value.trim());
+                });
+
+                const adminKeyInput = document.getElementById('admin-key');
+                const savedAdminKey = localStorage.getItem('aegis_admin_api_key');
+                if (savedAdminKey) {
+                    adminKeyInput.value = savedAdminKey;
+                }
+                adminKeyInput.addEventListener('input', () => {
+                    localStorage.setItem('aegis_admin_api_key', adminKeyInput.value.trim());
+                });
+            });
         </script>
     </body>
     </html>
     """
-    return raw_html.replace("__ENGINE_BADGE__", engine_badge).replace("__FALLBACK_BANNER__", fallback_banner).replace("__ENGINE_SIDEBAR__", engine_sidebar)
+    return (
+        raw_html.replace("__ENGINE_BADGE__", engine_badge)
+        .replace("__FALLBACK_BANNER__", fallback_banner)
+        .replace("__ENGINE_SIDEBAR__", engine_sidebar)
+        .replace("__DEFAULT_DEV_KEY__", default_dev_key)
+    )
 
 
 # --- Web UI: Operational Metrics Dashboard ---
