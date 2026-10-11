@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from collections import OrderedDict
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Set
 import numpy as np
 
 from app.config import settings
@@ -87,6 +87,65 @@ def normalize_text_for_embedding(text: str) -> str:
     t = " ".join(normalized_words)
     t = re.sub(r'\s+', ' ', t)
     return t.strip()
+
+
+# Antonym / opposing polarity pairs for semantic cache negation guard.
+# Prevents false positive cache hits between opposing boolean requests (e.g. enable 2FA vs disable 2FA).
+POLARITY_PAIRS = [
+    ({"enable", "enabled", "enabling", "turn on", "activate", "activating"}, {"disable", "disabled", "disabling", "turn off", "deactivate", "deactivating"}),
+    ({"allow", "allowed", "allowing"}, {"deny", "denied", "denying", "block", "blocked", "blocking"}),
+    ({"start", "started", "starting"}, {"stop", "stopped", "stopping"}),
+    ({"increase", "increasing"}, {"decrease", "decreasing"}),
+    ({"add", "adding"}, {"remove", "removing", "delete", "deleting"}),
+    ({"connect", "connected"}, {"disconnect", "disconnected"}),
+    ({"lock", "locked"}, {"unlock", "unlocked"}),
+    ({"subscribe", "subscribing"}, {"unsubscribe", "unsubscribing"}),
+    ({"credit", "credited"}, {"debit", "debited"}),
+    ({"deposit", "depositing"}, {"withdraw", "withdrawing"}),
+]
+
+
+def _extract_guard_features(text: str) -> Tuple[Set[str], Set[Tuple[int, str]]]:
+    """Extract numeric entities and polarity categories from query prompts."""
+    # Extract numbers (normalize out thousands separators e.g. 1,000 -> 1000)
+    raw_nums = re.findall(r'\b\d+(?:,\d+)*(?:\.\d+)?\b', text)
+    numbers = {num.replace(',', '') for num in raw_nums}
+
+    polarities: Set[Tuple[int, str]] = set()
+    text_lower = text.lower()
+    for i, (pos_set, neg_set) in enumerate(POLARITY_PAIRS):
+        for term in pos_set:
+            if re.search(r'\b' + re.escape(term) + r'\b', text_lower):
+                polarities.add((i, "pos"))
+                break
+        for term in neg_set:
+            if re.search(r'\b' + re.escape(term) + r'\b', text_lower):
+                polarities.add((i, "neg"))
+                break
+
+    return numbers, polarities
+
+
+def entity_and_polarity_guard(candidate_prompt: str, query_prompt: str) -> bool:
+    """
+    High-precision post-embedding guard for semantic cache verification.
+    Rejects hits with mismatched numeric entities (e.g. refund 500 vs 5000, transfer 10 vs 1000)
+    or contradictory antonym polarities (e.g. enable 2FA vs disable 2FA).
+    """
+    c_nums, c_pol = _extract_guard_features(candidate_prompt)
+    q_nums, q_pol = _extract_guard_features(query_prompt)
+
+    # 1. Number integrity: if numbers are present, sets must be identical
+    if (c_nums or q_nums) and (c_nums != q_nums):
+        return False
+
+    # 2. Polarity integrity: opposing actions reject
+    for p in c_pol:
+        opp = (p[0], "neg" if p[1] == "pos" else "pos")
+        if opp in q_pol:
+            return False
+
+    return True
 
 
 class FastNumpyEmbedder:
@@ -381,18 +440,30 @@ class SemanticCache:
                 
                 # Vectors are unit normalized, cosine similarity = dot product
                 scores = np.dot(matrix, query_vec)
-                best_sub_idx = int(np.argmax(scores))
-                best_score = float(scores[best_sub_idx])
+                sorted_sub_indices = np.argsort(scores)[::-1]
+                best_overall_score = float(scores[sorted_sub_indices[0]])
 
-                if best_score >= effective_threshold:
-                    matched_idx = candidate_indices[best_sub_idx]
-                    hit_resp = partition.entries[matched_idx].model_copy(deep=True)
-                    hit_resp.cached = True
-                    hit_resp.cache_type = "L2_SEMANTIC"
-                    hit_resp.similarity_score = round(best_score, 4)
-                    return hit_resp, "L2_SEMANTIC", best_score
-                else:
-                    return None, None, best_score
+                for sub_idx in sorted_sub_indices:
+                    score = float(scores[sub_idx])
+                    if score < effective_threshold:
+                        break
+                    matched_idx = candidate_indices[sub_idx]
+                    candidate_prompt = partition.prompts[matched_idx]
+
+                    # Verify high-precision entity & polarity guard (antonyms, number integrity)
+                    if entity_and_polarity_guard(candidate_prompt, prompt_text):
+                        hit_resp = partition.entries[matched_idx].model_copy(deep=True)
+                        hit_resp.cached = True
+                        hit_resp.cache_type = "L2_SEMANTIC"
+                        hit_resp.similarity_score = round(score, 4)
+                        return hit_resp, "L2_SEMANTIC", score
+                    else:
+                        logger.debug(
+                            f"L2 candidate rejected by Entity/Polarity Guard (score: {score:.4f}): "
+                            f"'{candidate_prompt}' vs '{prompt_text}'"
+                        )
+
+                return None, None, best_overall_score
 
         return None, None, 0.0
 

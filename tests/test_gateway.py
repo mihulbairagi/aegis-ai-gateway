@@ -598,6 +598,48 @@ def test_half_open_probe_released_without_verdict_and_self_heals():
     circuit_breaker.last_probe_time = time.monotonic() - (circuit_breaker.recovery_timeout + 1.0)
     assert circuit_breaker.get_route()[0] == "primary"
 
+
+def test_entity_and_polarity_guard_prevents_false_positives():
+    """Verify that entity (numbers) and polarity (antonyms like enable vs disable)
+    guards reject false positive L2 semantic hits even when cosine similarity exceeds 0.85."""
+    reset_state()
+    # 1. Polarity test: enable 2FA vs disable 2FA (raw MiniLM cosine is ~0.888)
+    p_enable = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "how do I enable 2FA"}]
+    }
+    res1 = client.post("/v1/chat/completions", json=p_enable, headers=ALPHA_HEADERS)
+    assert res1.status_code == 200
+    assert res1.headers.get("x-gateway-cache-status") == "MISS"
+
+    # Opposing polarity MUST be rejected by polarity guard
+    p_disable = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "how do I disable 2FA"}]
+    }
+    res2 = client.post("/v1/chat/completions", json=p_disable, headers=ALPHA_HEADERS)
+    assert res2.status_code == 200
+    assert res2.headers.get("x-gateway-cache-status") == "MISS", "Polarity guard failed to reject disable vs enable!"
+
+    # 2. Number entity test: refund order 500 vs 5000 (raw MiniLM cosine is ~0.915)
+    p_order500 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "refund order 500"}]
+    }
+    res3 = client.post("/v1/chat/completions", json=p_order500, headers=ALPHA_HEADERS)
+    assert res3.status_code == 200
+
+    # Different number entity MUST be rejected by number guard
+    p_order5000 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "refund order 5000"}]
+    }
+    res4 = client.post("/v1/chat/completions", json=p_order5000, headers=ALPHA_HEADERS)
+    assert res4.status_code == 200
+    assert res4.headers.get("x-gateway-cache-status") == "MISS", "Number entity guard failed to reject 5000 vs 500!"
+    print("[PASS] test_entity_and_polarity_guard_prevents_false_positives")
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -624,6 +666,7 @@ if __name__ == "__main__":
     test_normalizer_preserves_numbers_and_distinct_words()
     test_metrics_poll_does_not_consume_half_open_probe()
     test_half_open_probe_released_without_verdict_and_self_heals()
-    print("\nALL 25 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_entity_and_polarity_guard_prevents_false_positives()
+    print("\nALL 26 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 
