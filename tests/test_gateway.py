@@ -28,8 +28,7 @@ def reset_state():
     """Clear caches, SQLite records, and state before each test."""
     semantic_cache.clear()
     rate_limiter.buckets.clear()
-    circuit_breaker.state = CircuitState.CLOSED
-    circuit_breaker.consecutive_failures = 0
+    circuit_breaker.reset()
 
 
 def test_auth_and_unauthorized_rejection():
@@ -279,6 +278,40 @@ def test_circuit_breaker_auto_failover():
     print("[PASS] test_circuit_breaker_auto_failover")
 
 
+def test_circuit_breaker_half_open_probe_limit():
+    """Verify in HALF_OPEN that concurrent probes are limited to primary and excess requests route to fallback."""
+    reset_state()
+    # Trip circuit to OPEN
+    for _ in range(3):
+        circuit_breaker.record_failure()
+    assert circuit_breaker.state == CircuitState.OPEN
+
+    # Fast forward past recovery timeout
+    circuit_breaker.last_state_change = time.monotonic() - (circuit_breaker.recovery_timeout + 5.0)
+
+    # 1st request triggers transition to HALF_OPEN and gets route "primary"
+    route1, state1 = circuit_breaker.get_route()
+    assert state1 == CircuitState.HALF_OPEN
+    assert route1 == "primary"
+
+    # 2nd concurrent request while 1st probe is still inflight MUST route to "fallback"
+    route2, state2 = circuit_breaker.get_route()
+    assert state2 == CircuitState.HALF_OPEN
+    assert route2 == "fallback"
+
+    # 1st probe succeeds -> inflight probe freed
+    circuit_breaker.record_success()
+
+    # Now next probe can go to primary
+    route3, state3 = circuit_breaker.get_route()
+    assert route3 == "primary"
+
+    # 2nd success closes circuit back to CLOSED
+    circuit_breaker.record_success()
+    assert circuit_breaker.state == CircuitState.CLOSED
+    print("[PASS] test_circuit_breaker_half_open_probe_limit")
+
+
 def test_web_ui_endpoints():
     """Verify Web Playground and Dashboard endpoints render properly."""
     res_playground = client.get("/playground")
@@ -483,6 +516,7 @@ if __name__ == "__main__":
     test_cache_bypass_header()
     test_rate_limiter_exceeded()
     test_circuit_breaker_auto_failover()
+    test_circuit_breaker_half_open_probe_limit()
     test_web_ui_endpoints()
     test_playground_does_not_leak_admin_key()
     test_old_default_admin_key_rejected()
@@ -490,5 +524,5 @@ if __name__ == "__main__":
     test_expired_entries_not_served_after_restart()
     test_purge_expired_removes_sqlite_rows()
     test_client_ttl_is_capped()
-    print("\nALL 19 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    print("\nALL 20 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 

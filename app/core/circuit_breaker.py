@@ -12,20 +12,24 @@ class CircuitBreaker:
     """
     State machine for upstream provider resiliency and automatic failover.
     Protects downstream latency when OpenAI/Anthropic/Gemini fail or return 500/503.
+    Limits concurrent probes in HALF_OPEN to avoid overwhelming struggling upstreams.
     """
     def __init__(
         self,
         failure_threshold: int = settings.CIRCUIT_FAILURE_THRESHOLD,
-        recovery_timeout: float = settings.CIRCUIT_RECOVERY_TIMEOUT
+        recovery_timeout: float = settings.CIRCUIT_RECOVERY_TIMEOUT,
+        half_open_max_probes: int = 1
     ):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
+        self.half_open_max_probes = half_open_max_probes
         
         self.state = CircuitState.CLOSED
         self.consecutive_failures = 0
         self.consecutive_successes = 0
         self.last_state_change = time.monotonic()
         self.last_failure_time = 0.0
+        self.inflight_probes = 0
 
     def get_route(self) -> Tuple[str, CircuitState]:
         """
@@ -39,12 +43,16 @@ class CircuitBreaker:
                 self.state = CircuitState.HALF_OPEN
                 self.last_state_change = now
                 self.consecutive_successes = 0
+                self.inflight_probes = 1
                 return "primary", self.state
             return "fallback", self.state
 
         elif self.state == CircuitState.HALF_OPEN:
-            # Send single probe to primary
-            return "primary", self.state
+            # Only permit up to half_open_max_probes to primary; excess traffic routes safely to fallback
+            if self.inflight_probes < self.half_open_max_probes:
+                self.inflight_probes += 1
+                return "primary", self.state
+            return "fallback", self.state
 
         # CLOSED state
         return "primary", self.state
@@ -52,11 +60,13 @@ class CircuitBreaker:
     def record_success(self):
         """Called when an upstream request succeeds."""
         if self.state == CircuitState.HALF_OPEN:
+            self.inflight_probes = max(0, self.inflight_probes - 1)
             self.consecutive_successes += 1
             if self.consecutive_successes >= 2:
                 # Primary proven healthy again, close circuit
                 self.state = CircuitState.CLOSED
                 self.consecutive_failures = 0
+                self.inflight_probes = 0
                 self.last_state_change = time.monotonic()
         elif self.state == CircuitState.CLOSED:
             self.consecutive_failures = 0
@@ -65,15 +75,26 @@ class CircuitBreaker:
         """Called when an upstream request times out or returns 5xx."""
         now = time.monotonic()
         self.last_failure_time = now
-        self.consecutive_failures += 1
+        self.inflight_probes = 0
 
-        if self.state == CircuitState.CLOSED and self.consecutive_failures >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            self.last_state_change = now
+        if self.state == CircuitState.CLOSED:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+                self.last_state_change = now
 
         elif self.state == CircuitState.HALF_OPEN:
             # Probe failed, trip back to OPEN immediately
             self.state = CircuitState.OPEN
             self.last_state_change = now
+
+    def reset(self):
+        """Reset circuit breaker to pristine CLOSED state."""
+        self.state = CircuitState.CLOSED
+        self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.inflight_probes = 0
+        self.last_state_change = time.monotonic()
+        self.last_failure_time = 0.0
 
 circuit_breaker = CircuitBreaker()
