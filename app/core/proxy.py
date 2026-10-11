@@ -1,16 +1,19 @@
 import time
+import json
+import uuid
+import asyncio
 import httpx
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, AsyncGenerator
 from fastapi import HTTPException
-from app.config import settings
+from app.config import settings, get_active_provider_info
 from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo
 from app.core.circuit_breaker import circuit_breaker
 
 class UpstreamProxy:
     """
-    High-concurrency async reverse proxy client with connection pooling,
-    automatic circuit-breaker failover, and zero-token simulated mock fallback.
-    Distinguishes client 4xx errors (no circuit trip) from 5xx/timeouts (circuit trip).
+    High-concurrency async reverse proxy supporting multi-provider routing
+    (Ollama, Groq, OpenAI, RouterPlus) with full SSE streaming passthrough
+    and automatic circuit-breaker failover.
     """
     def __init__(self):
         # High-throughput connection pool: 100 keep-alive, 500 max connections
@@ -22,29 +25,30 @@ class UpstreamProxy:
     def _is_live_key(self, key: str) -> bool:
         if not key:
             return False
-        return key not in ("mock-primary-key", "mock-fallback-key", "your-primary-api-key-here", "")
+        return key not in ("mock-primary-key", "mock-fallback-key", "your-primary-api-key-here", "dummy", "")
 
     async def forward(self, request: ChatCompletionRequest) -> Tuple[ChatCompletionResponse, str]:
         """
-        Routes request to healthy upstream provider.
+        Routes non-streaming request to active healthy upstream provider.
         Returns: (ChatCompletionResponse, provider_name: str)
         """
         route, state = circuit_breaker.get_route()
-        is_live_primary = self._is_live_key(settings.PRIMARY_API_KEY)
+        active = get_active_provider_info()
+        is_live = self._is_live_key(active["api_key"]) or active["name"] == "ollama"
 
-        if is_live_primary and route == "primary":
+        if is_live and route == "primary":
             try:
                 payload = request.model_dump(exclude_unset=True)
                 if not payload.get("model"):
-                    payload["model"] = settings.PRIMARY_MODEL
+                    payload["model"] = active["default_model"]
 
                 response = await self._call_upstream(
-                    url=f"{settings.PRIMARY_PROVIDER_URL}/chat/completions",
-                    api_key=settings.PRIMARY_API_KEY,
+                    url=f"{active['url'].rstrip('/')}/chat/completions",
+                    api_key=active["api_key"],
                     payload=payload
                 )
                 circuit_breaker.record_success()
-                return response, "primary_live"
+                return response, f"{active['name']}_live"
             except httpx.HTTPStatusError as e:
                 # 4xx client errors MUST NOT trip the circuit breaker
                 if 400 <= e.response.status_code < 500:
@@ -52,7 +56,6 @@ class UpstreamProxy:
                         status_code=e.response.status_code,
                         detail=f"Upstream provider client error ({e.response.status_code}): {e.response.text[:200]}"
                     )
-                # 5xx server error from upstream: record failure and try fallback
                 circuit_breaker.record_failure()
                 return await self._call_fallback(request)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError):
@@ -62,8 +65,99 @@ class UpstreamProxy:
                 circuit_breaker.record_failure()
                 return await self._call_fallback(request)
 
-        # Fallback / Simulated mode for fast local testing and benchmarks
+        # Fallback / Simulated mode for fast local testing and offline benchmarks
         return await self._call_simulated_upstream(request, route)
+
+    async def forward_stream(
+        self,
+        request: ChatCompletionRequest
+    ) -> Tuple[AsyncGenerator[str, None], str]:
+        """
+        Routes streaming request to upstream with SSE chunk passthrough.
+        Returns: (AsyncGenerator yielding 'data: {...}\n\n', provider_name)
+        """
+        route, state = circuit_breaker.get_route()
+        active = get_active_provider_info()
+        is_live = self._is_live_key(active["api_key"]) or active["name"] == "ollama"
+
+        if is_live and route == "primary":
+            try:
+                payload = request.model_dump(exclude_unset=True)
+                payload["stream"] = True
+                if not payload.get("model"):
+                    payload["model"] = active["default_model"]
+
+                url = f"{active['url'].rstrip('/')}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {active['api_key']}",
+                    "Content-Type": "application/json"
+                }
+
+                async def live_stream_generator():
+                    try:
+                        async with self.client.stream("POST", url, headers=headers, json=payload) as resp:
+                            if resp.status_code >= 400:
+                                error_text = await resp.aread()
+                                yield f"data: {json.dumps({'error': error_text.decode('utf-8', errors='ignore')})}\n\n"
+                                return
+                            circuit_breaker.record_success()
+                            async for line in resp.aiter_lines():
+                                if line:
+                                    yield f"{line}\n\n"
+                    except Exception as exc:
+                        circuit_breaker.record_failure()
+                        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                return live_stream_generator(), f"{active['name']}_stream"
+            except Exception:
+                circuit_breaker.record_failure()
+
+        # Simulated stream for local development / testing
+        return self._simulated_stream_generator(request, route), f"simulated_{route}_stream"
+
+    async def _simulated_stream_generator(
+        self,
+        request: ChatCompletionRequest,
+        route: str
+    ) -> AsyncGenerator[str, None]:
+        """Simulates token-by-token OpenAI SSE streaming for offline/testing use."""
+        last_msg = request.messages[-1].content if request.messages else "Hello"
+        answer = f"Processed response for: '{last_msg[:60]}...' via {route} engine."
+        words = answer.split()
+        chunk_id = f"chatcmpl-stream-{uuid.uuid4().hex[:8]}"
+
+        for i, word in enumerate(words):
+            delta = {"role": "assistant"} if i == 0 else {}
+            delta["content"] = word + (" " if i < len(words) - 1 else "")
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            await asyncio.sleep(0.015)  # 15ms typewriter delay
+
+        # Final stop chunk
+        stop_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(stop_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
 
     async def _call_fallback(self, request: ChatCompletionRequest) -> Tuple[ChatCompletionResponse, str]:
         """Calls secondary fallback provider."""
@@ -101,10 +195,7 @@ class UpstreamProxy:
         return ChatCompletionResponse.model_validate(data)
 
     async def _call_simulated_upstream(self, request: ChatCompletionRequest, route: str) -> Tuple[ChatCompletionResponse, str]:
-        """
-        Simulated upstream response (simulating real LLM completion)
-        Enables stress-testing at scale without external API dependency.
-        """
+        """Simulated upstream response (for testing and offline benchmarking)."""
         last_msg = request.messages[-1].content if request.messages else "Hello"
         answer = f"Processed response for: '{last_msg[:60]}...' via {route} engine."
 

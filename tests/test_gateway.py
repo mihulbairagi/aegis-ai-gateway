@@ -8,10 +8,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from fastapi.testclient import TestClient
 from app.main import app
-from app.config import settings
+from app.config import settings, get_active_provider_info
 from app.core.rate_limiter import rate_limiter
 from app.core.circuit_breaker import circuit_breaker, CircuitState
 from app.core.semantic_cache import semantic_cache
+from app.core.storage import sqlite_storage
 
 client = TestClient(app)
 
@@ -20,7 +21,7 @@ BETA_HEADERS = {"Authorization": "Bearer sk-aegis-tenant-beta"}
 ADMIN_HEADERS = {"X-Admin-Key": "admin-secret-key-12345"}
 
 def reset_state():
-    """Clear caches and state before each test."""
+    """Clear caches, SQLite records, and state before each test."""
     semantic_cache.clear()
     rate_limiter.buckets.clear()
     circuit_breaker.state = CircuitState.CLOSED
@@ -151,23 +152,77 @@ def test_dissimilar_queries_prevent_false_positives():
     }
     res2 = client.post("/v1/chat/completions", json=p2, headers=ALPHA_HEADERS)
     assert res2.status_code == 200
-    # Must be a MISS (cosine similarity ~0.63, safely below 0.85 threshold)
     assert res2.headers.get("x-gateway-cache-status") == "MISS"
     print("[PASS] test_dissimilar_queries_prevent_false_positives")
 
 
-def test_streaming_sse_clean_rejection():
-    """Verify request with stream: true returns clean 400 Bad Request."""
+def test_full_sse_streaming_miss_and_hit():
+    """
+    Verify full Server-Sent Events (SSE) streaming support:
+    - stream: true on MISS returns live chunk stream
+    - stream: true on HIT returns fast simulated SSE token chunks
+    """
     reset_state()
     payload = {
         "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": "Tell me a joke"}],
+        "messages": [{"role": "user", "content": "Explain binary search in three words"}],
         "stream": True
     }
+    
+    # 1. First streaming request -> MISS (SSE text/event-stream)
+    res1 = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+    assert res1.status_code == 200
+    assert "text/event-stream" in res1.headers.get("content-type", "")
+    assert res1.headers.get("x-gateway-cache-status") == "MISS"
+    lines1 = [line for line in res1.text.split("\n") if line.startswith("data: ")]
+    assert len(lines1) > 0
+    assert "data: [DONE]" in lines1
+
+    # Give worker a split-second to write background cache
+    time.sleep(0.05)
+
+    # 2. Second streaming request with same query -> Cache HIT (HIT-L1_EXACT streamed via SSE)
+    res2 = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+    assert res2.status_code == 200
+    assert "text/event-stream" in res2.headers.get("content-type", "")
+    assert res2.headers.get("x-gateway-cache-status") == "HIT-L1_EXACT"
+    lines2 = [line for line in res2.text.split("\n") if line.startswith("data: ")]
+    assert len(lines2) > 0
+    assert "data: [DONE]" in lines2
+    print("[PASS] test_full_sse_streaming_miss_and_hit")
+
+
+def test_sqlite_wal_persistence_and_warmup():
+    """Verify records saved to SQLite persist across in-memory cache clear and restore on warmup."""
+    reset_state()
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Persistent DB check query"}]
+    }
     res = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
-    assert res.status_code == 400
-    assert "Streaming SSE not supported" in res.json()["detail"]
-    print("[PASS] test_streaming_sse_clean_rejection")
+    assert res.status_code == 200
+
+    time.sleep(0.05)
+
+    # Verify SQLite file has the record
+    records = sqlite_storage.load_all_records()
+    assert len(records) >= 1
+    found = any("Persistent DB check" in r["prompt"] for r in records)
+    assert found, "Expected record was not found in SQLite storage!"
+
+    # Simulate process restart by clearing in-memory structures only
+    semantic_cache.l1_cache.clear()
+    for p in semantic_cache.l2_partitions.values():
+        p.clear()
+
+    # Trigger warmup (simulating server reboot)
+    semantic_cache.warmup()
+
+    # Verify query now hits L1 cache instantly without calling upstream!
+    res_after_reboot = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+    assert res_after_reboot.status_code == 200
+    assert res_after_reboot.headers.get("x-gateway-cache-status") == "HIT-L1_EXACT"
+    print("[PASS] test_sqlite_wal_persistence_and_warmup")
 
 
 def test_cache_bypass_header():
@@ -197,7 +252,6 @@ def test_rate_limiter_exceeded():
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "Burst ping"}]
     }
-    # Drain bucket for tenant-alpha
     rate_limiter.buckets["tenant-alpha"] = (0.0, time.monotonic())
 
     res = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
@@ -221,14 +275,32 @@ def test_circuit_breaker_auto_failover():
     print("[PASS] test_circuit_breaker_auto_failover")
 
 
+def test_web_ui_endpoints():
+    """Verify Web Playground and Dashboard endpoints render properly."""
+    res_playground = client.get("/playground")
+    assert res_playground.status_code == 200
+    assert "AEGIS PLAYGROUND" in res_playground.text
+
+    res_dashboard = client.get("/dashboard")
+    assert res_dashboard.status_code == 200
+    assert "AEGIS AI GATEWAY" in res_dashboard.text
+
+    provider_info = get_active_provider_info()
+    assert "url" in provider_info
+    assert "name" in provider_info
+    print("[PASS] test_web_ui_endpoints")
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
     test_multi_tenant_cache_isolation()
     test_l2_semantic_cache_hit_true_dense_embeddings()
     test_dissimilar_queries_prevent_false_positives()
-    test_streaming_sse_clean_rejection()
+    test_full_sse_streaming_miss_and_hit()
+    test_sqlite_wal_persistence_and_warmup()
     test_cache_bypass_header()
     test_rate_limiter_exceeded()
     test_circuit_breaker_auto_failover()
-    print("\nALL 9 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_web_ui_endpoints()
+    print("\nALL 11 PRODUCTION-HARDENED OPEN-SOURCE GATEWAY TESTS PASSED SUCCESSFULLY!")

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  aegis-gateway:
+    build: .
+    container_name: aegis-ai-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - UPSTREAM_PROVIDER=${UPSTREAM_PROVIDER:-routerplus}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ROUTERPLUS_API_KEY=${ROUTERPLUS_API_KEY:-}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-admin-secret-key-12345}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

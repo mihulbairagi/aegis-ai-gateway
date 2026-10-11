@@ -10,3 +10,10 @@ ENV/
 .idea/
 .vscode/
 *.log
+data/
+*.db
+*.sqlite
+*.sqlite3
+dist/
+build/
+*.egg-info/

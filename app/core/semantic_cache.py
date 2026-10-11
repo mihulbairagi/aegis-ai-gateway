@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import json
+import logging
 import re
 import time
 from collections import OrderedDict
@@ -8,6 +10,9 @@ import numpy as np
 
 from app.config import settings
 from app.models.schemas import ChatCompletionResponse, ChatCompletionRequest
+from app.core.storage import sqlite_storage
+
+logger = logging.getLogger(__name__)
 
 class FastNumpyEmbedder:
     """
@@ -120,9 +125,10 @@ class TenantL2Partition:
 
 class SemanticCache:
     """
-    Production-Hardened Multi-Tenant Semantic Cache:
+    Production-Hardened Multi-Tenant Semantic Cache with SQLite WAL Persistence:
     - Tier 1 (L1): O(1) Exact-match LRU partitioned by (tenant_id, model, temperature) (<0.1ms)
     - Tier 2 (L2): Dense ONNX Semantic Vector Search partitioned strictly per tenant (<15ms)
+    - Persistent SQLite disk backing: Automatic warmup on reboot, zero loss across restarts.
     - Non-blocking async embedding execution via asyncio.to_thread
     - Per-entry TTL invalidation and Client-controlled bypass (X-Bypass-Cache)
     """
@@ -145,6 +151,41 @@ class SemanticCache:
         self.l2_partitions: Dict[str, TenantL2Partition] = {}
         
         self.embedder = FastEmbedDenseEmbedder(model_name=settings.EMBEDDING_MODEL)
+
+        # Warm up existing entries from SQLite disk persistence
+        self.warmup()
+
+    def warmup(self):
+        """Warm up in-memory indices from persistent SQLite storage on process start."""
+        records = sqlite_storage.load_all_records()
+        now = time.monotonic()
+        for r in records:
+            try:
+                resp_data = json.loads(r["response_json"])
+                resp = ChatCompletionResponse.model_validate(resp_data)
+                tenant_id = r["tenant_id"]
+                model = r["model"]
+                temp = float(r["temperature"])
+                prompt = r["prompt"]
+                ttl = float(r["ttl"])
+                created_at = float(r["created_at"])
+                vector = r["vector"]
+
+                prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+                l1_key = f"{tenant_id}:{model}:{temp}:{prompt_hash}"
+                self.l1_cache[l1_key] = (resp, created_at, ttl)
+
+                if vector is not None and len(vector) == self.embedder.dim:
+                    partition = self._get_partition(tenant_id)
+                    partition.vectors.append(vector)
+                    partition.entries.append(resp)
+                    partition.prompts.append(prompt)
+                    partition.models.append(model)
+                    partition.temperatures.append(temp)
+                    partition.timestamps.append(created_at)
+                    partition.ttls.append(ttl)
+            except Exception as e:
+                logger.debug(f"Cache warmup item skipped: {e}")
 
     def _get_partition(self, tenant_id: str) -> TenantL2Partition:
         if tenant_id not in self.l2_partitions:
@@ -189,6 +230,8 @@ class SemanticCache:
                 hit_resp = resp.model_copy(deep=True)
                 hit_resp.cached = True
                 hit_resp.cache_type = "L1_EXACT"
+                # Track hit in SQLite
+                sqlite_storage.increment_hits(l1_key)
                 return hit_resp, "L1_EXACT"
 
         # 2. Check Tier 2 (L2 Semantic Cosine Similarity within tenant partition)
@@ -206,7 +249,6 @@ class SemanticCache:
 
             if candidate_indices:
                 prompt_text = self._extract_prompt_text(request)
-                # Run CPU embedding inference asynchronously in worker thread (non-blocking)
                 query_vec = await asyncio.to_thread(self.embedder.embed, prompt_text)
 
                 candidate_vectors = [partition.vectors[i] for i in candidate_indices]
@@ -234,7 +276,7 @@ class SemanticCache:
         bypass_cache: bool = False,
         ttl_seconds: Optional[float] = None
     ):
-        """Stores response in L1 and L2 caches partitioned by tenant."""
+        """Stores response in L1, L2, and SQLite disk storage asynchronously."""
         if bypass_cache:
             return
 
@@ -264,11 +306,27 @@ class SemanticCache:
         partition.timestamps.append(now)
         partition.ttls.append(ttl)
 
+        # Asynchronously persist to SQLite disk in worker thread (zero event loop delay)
+        resp_json = response.model_dump_json()
+        asyncio.create_task(asyncio.to_thread(
+            sqlite_storage.save_record,
+            l1_key,
+            tenant_id,
+            request.model,
+            req_temp,
+            prompt_text,
+            resp_json,
+            vec,
+            now,
+            ttl
+        ))
+
     def clear(self):
-        """Flushes all tenant L1 and L2 caches."""
+        """Flushes all tenant L1 and L2 caches and clears SQLite database."""
         self.l1_cache.clear()
         for partition in self.l2_partitions.values():
             partition.clear()
         self.l2_partitions.clear()
+        sqlite_storage.clear()
 
 semantic_cache = SemanticCache()

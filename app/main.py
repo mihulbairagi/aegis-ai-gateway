@@ -1,14 +1,16 @@
 import asyncio
+import json
 import time
+import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import FastAPI, Request, HTTPException, Response, status, Header
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings, authenticate_tenant, verify_admin_key
-from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, GatewayMetricsResponse
+from app.config import settings, authenticate_tenant, verify_admin_key, get_active_provider_info
+from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo, GatewayMetricsResponse
 from app.core.rate_limiter import rate_limiter
 from app.core.semantic_cache import semantic_cache
 from app.core.circuit_breaker import circuit_breaker, CircuitState
@@ -36,12 +38,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Aegis AI Gateway & Semantic Cache",
-    description="High-Throughput Enterprise AI Reverse Proxy with L1/L2 Semantic Caching, Token-Bucket Rate Limiting, Multi-Tenant Isolation, and Circuit Breakers.",
-    version="1.2.0",
+    description="High-Throughput Enterprise AI Reverse Proxy with L1/L2 Semantic Caching, SQLite WAL Persistence, Token-Bucket Rate Limiting, Multi-Tenant Isolation, and Multi-Provider Routing.",
+    version="1.3.0",
     lifespan=lifespan
 )
 
-# Enable CORS for dashboards and frontend apps
+# Enable CORS for all frontends/dashboards
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,18 +76,11 @@ def _require_admin(request: Request):
         )
 
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+@app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request, response: Response):
     start_time = time.monotonic()
 
-    # 1. Reject streaming requests with explicit 400 Bad Request
-    if req.stream:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Streaming SSE not supported in this gateway version. Set stream: false or omit the stream parameter."
-        )
-
-    # 2. Client Authentication & Multi-Tenant Identification
+    # 1. Client Authentication & Multi-Tenant Identification
     token = _get_api_token(request)
     tenant_id = authenticate_tenant(token)
     if not tenant_id:
@@ -94,7 +89,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
             detail="Unauthorized: Invalid or missing client API key. Pre-configured dev keys include: 'sk-aegis-tenant-alpha', 'sk-aegis-tenant-beta', 'sk-aegis-test', 'sk-aegis-benchmark'."
         )
 
-    # 3. Rate Limiting (Token Bucket per tenant)
+    # 2. Rate Limiting (Token Bucket per tenant)
     allowed, retry_after = rate_limiter.is_allowed(tenant_id)
     if not allowed:
         retry_val = str(round(retry_after, 2))
@@ -104,7 +99,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
             headers={"Retry-After": retry_val}
         )
 
-    # 4. Cache-Control & TTL extraction
+    # 3. Cache-Control & TTL extraction
     bypass_cache = (
         request.headers.get("X-Bypass-Cache", "").lower() in ("true", "1") or
         request.headers.get("Cache-Control", "").lower() == "no-cache"
@@ -112,12 +107,104 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     raw_ttl = request.headers.get("X-Cache-TTL")
     custom_ttl = float(raw_ttl) if raw_ttl and raw_ttl.isdigit() else None
 
-    # 5. Check Tiered Multi-Tenant Cache (L1 Exact & L2 Semantic Cosine Match)
+    # 4. Check Tiered Multi-Tenant Cache (L1 Exact & L2 Semantic Cosine Match)
     cached_resp, cache_type = await semantic_cache.get(
         req,
         tenant_id=tenant_id,
         bypass_cache=bypass_cache
     )
+
+    # --- STREAMING RESPONSE HANDLING (req.stream == True) ---
+    if req.stream:
+        if cached_resp:
+            # Stream from in-memory cached response with simulated typewriter emission
+            async def stream_cached_chunks():
+                full_text = cached_resp.choices[0].message.content
+                words = full_text.split(" ")
+                chunk_id = f"chatcmpl-cached-{uuid.uuid4().hex[:8]}"
+                
+                for i, word in enumerate(words):
+                    chunk_payload = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant" if i == 0 else None,
+                                "content": word + (" " if i < len(words) - 1 else "")
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(chunk_payload)}\n\n"
+                    await asyncio.sleep(0.005)  # 5ms ultra-fast emission
+
+                stop_payload = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(stop_payload)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            latency_ms = (time.monotonic() - start_time) * 1000.0
+            metrics_tracker.record_request(latency_ms, cache_type=cache_type, tokens_saved=cached_resp.usage.total_tokens)
+            stream_headers = {
+                "X-Gateway-Tenant-Id": tenant_id,
+                "X-Gateway-Cache-Status": f"HIT-{cache_type}",
+                "X-Gateway-Latency-Ms": str(round(latency_ms, 2)),
+                "Content-Type": "text/event-stream"
+            }
+            return StreamingResponse(stream_cached_chunks(), media_type="text/event-stream", headers=stream_headers)
+
+        # Cache Miss on Streaming: Stream live from upstream and accumulate in background
+        stream_gen, provider_name = await proxy_client.forward_stream(req)
+
+        async def stream_and_cache_wrapper():
+            accumulated_chunks = []
+            try:
+                async for line in stream_gen:
+                    yield line
+                    if line.startswith("data: ") and not line.startswith("data: [DONE]"):
+                        try:
+                            data = json.loads(line[6:].strip())
+                            delta_content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta_content:
+                                accumulated_chunks.append(delta_content)
+                        except Exception:
+                            pass
+            finally:
+                if accumulated_chunks:
+                    full_content = "".join(accumulated_chunks)
+                    p_tokens = sum(len(m.content.split()) for m in req.messages) + 10
+                    c_tokens = len(full_content.split()) + 5
+                    reconstructed = ChatCompletionResponse(
+                        model=req.model,
+                        choices=[ChatChoice(message=ChatMessage(role="assistant", content=full_content))],
+                        usage=UsageInfo(
+                            prompt_tokens=p_tokens,
+                            completion_tokens=c_tokens,
+                            total_tokens=p_tokens + c_tokens
+                        ),
+                        provider=provider_name
+                    )
+                    await semantic_cache.put(req, reconstructed, tenant_id=tenant_id, bypass_cache=bypass_cache, ttl_seconds=custom_ttl)
+                    latency_ms = (time.monotonic() - start_time) * 1000.0
+                    metrics_tracker.record_request(latency_ms, cache_type=None)
+
+        stream_headers = {
+            "X-Gateway-Tenant-Id": tenant_id,
+            "X-Gateway-Cache-Status": "MISS",
+            "X-Gateway-Provider": provider_name,
+            "Content-Type": "text/event-stream"
+        }
+        return StreamingResponse(stream_and_cache_wrapper(), media_type="text/event-stream", headers=stream_headers)
+
+    # --- NON-STREAMING STANDARD RESPONSE ---
     if cached_resp:
         latency_ms = (time.monotonic() - start_time) * 1000.0
         cached_resp.latency_ms = round(latency_ms, 2)
@@ -132,7 +219,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
         response.headers["X-Gateway-Latency-Ms"] = str(round(latency_ms, 2))
         return cached_resp
 
-    # 6. Cache Miss -> Forward to Upstream Provider via Circuit Breaker
+    # Cache Miss -> Forward to Upstream Provider via Circuit Breaker
     upstream_resp, provider = await proxy_client.forward(req)
     latency_ms = (time.monotonic() - start_time) * 1000.0
 
@@ -140,7 +227,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     upstream_resp.provider = provider
     upstream_resp.cached = False
 
-    # 7. Store in Cache (partitioned strictly by tenant)
+    # Store in Cache (partitioned by tenant and persisted to SQLite)
     await semantic_cache.put(
         req,
         upstream_resp,
@@ -149,7 +236,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
         ttl_seconds=custom_ttl
     )
 
-    # 8. Record telemetry
+    # Record telemetry
     metrics_tracker.record_request(latency_ms, cache_type=None)
 
     response.headers["X-Gateway-Tenant-Id"] = tenant_id
@@ -163,8 +250,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
 async def get_metrics():
     summary = metrics_tracker.get_summary()
     route, state = circuit_breaker.get_route()
+    provider_info = get_active_provider_info()
     summary["circuit_breaker_state"] = state.value
-    summary["active_provider"] = route
+    summary["active_provider"] = f"{provider_info['name']} ({route})"
     return summary
 
 
@@ -172,7 +260,7 @@ async def get_metrics():
 
 @app.post("/v1/gateway/circuit-breaker/trip")
 async def force_trip_circuit(request: Request):
-    """Admin endpoint: Simulate upstream outage for chaos testing."""
+    """Admin endpoint: Chaos testing for circuit breaker failover."""
     _require_admin(request)
     circuit_breaker.state = CircuitState.OPEN
     circuit_breaker.last_state_change = time.monotonic()
@@ -190,11 +278,257 @@ async def reset_circuit(request: Request):
 
 @app.delete("/v1/gateway/cache")
 async def flush_cache(request: Request):
-    """Admin endpoint: Purge all L1 and L2 tenant caches."""
+    """Admin endpoint: Purge all in-memory L1/L2 caches and SQLite persistent storage."""
     _require_admin(request)
     semantic_cache.clear()
-    return {"message": "All L1 & L2 tenant caches purged successfully"}
+    return {"message": "All L1 & L2 tenant caches and SQLite records purged successfully"}
 
+
+# --- Web UI: Interactive Chat Playground ---
+
+@app.get("/playground", response_class=HTMLResponse)
+async def interactive_playground():
+    """Interactive Chat Playground with real-time semantic caching badges."""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Aegis AI Gateway Playground</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            body { font-family: 'Inter', sans-serif; }
+            code, pre, .font-mono { font-family: 'JetBrains Mono', monospace; }
+        </style>
+    </head>
+    <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
+        <!-- Top Navigation -->
+        <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur px-6 py-3 flex justify-between items-center sticky top-0 z-50">
+            <div class="flex items-center space-x-3">
+                <span class="text-xl font-black bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">AEGIS PLAYGROUND</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.3.0</span>
+            </div>
+            <div class="flex items-center space-x-4">
+                <a href="/dashboard" class="text-xs text-slate-400 hover:text-white transition">📊 Live Dashboard</a>
+                <a href="/docs" target="_blank" class="text-xs text-slate-400 hover:text-white transition">📖 API Docs</a>
+                <button onclick="purgeCache()" class="text-xs px-3 py-1 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 border border-rose-500/30 rounded transition">
+                    🗑️ Purge Cache
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Workspace -->
+        <div class="flex-1 max-w-6xl w-full mx-auto p-6 grid grid-cols-1 md:grid-cols-4 gap-6">
+            <!-- Left Config Sidebar -->
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4 h-fit">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400">Gateway Controls</h3>
+                
+                <div>
+                    <label class="text-xs text-slate-400 block mb-1">Tenant API Key</label>
+                    <input id="api-key" type="password" value="sk-aegis-tenant-alpha" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
+                </div>
+
+                <div>
+                    <label class="text-xs text-slate-400 block mb-1">Model Target</label>
+                    <input id="model" type="text" value="gpt-4o-mini" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
+                </div>
+
+                <div>
+                    <label class="text-xs text-slate-400 block mb-1">Temperature: <span id="temp-val" class="text-indigo-400 font-mono">0.0</span></label>
+                    <input id="temperature" type="range" min="0" max="1" step="0.1" value="0.0" oninput="document.getElementById('temp-val').innerText = this.value" class="w-full accent-indigo-500">
+                </div>
+
+                <div class="pt-2 border-t border-slate-800 space-y-2">
+                    <label class="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer">
+                        <input id="bypass-cache" type="checkbox" class="accent-indigo-500">
+                        <span>Bypass Cache (X-Bypass-Cache)</span>
+                    </label>
+                    <label class="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer">
+                        <input id="use-stream" type="checkbox" checked class="accent-indigo-500">
+                        <span>Enable SSE Streaming</span>
+                    </label>
+                </div>
+
+                <div class="pt-3 border-t border-slate-800">
+                    <div class="text-[11px] text-slate-400">
+                        <div class="font-semibold text-slate-300 mb-1">💡 Pro Tip for Testing:</div>
+                        1. Type <span class="text-indigo-300 font-mono">"How to cancel my subscription?"</span> (Observe MISS ~1,400ms)<br>
+                        2. Type <span class="text-emerald-300 font-mono">"What is the procedure to cancel subscription?"</span> (Observe L2 HIT ~12ms)!
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Chat Container -->
+            <div class="md:col-span-3 bg-slate-900 border border-slate-800 rounded-xl flex flex-col h-[75vh]">
+                <!-- Chat Message Feed -->
+                <div id="chat-feed" class="flex-1 overflow-y-auto p-5 space-y-4">
+                    <div class="text-center text-xs text-slate-400 py-4">
+                        🚀 Welcome to Aegis Playground. Start chatting to test instant L1 exact hits & ONNX dense L2 semantic matches.
+                    </div>
+                </div>
+
+                <!-- Chat Input Form -->
+                <div class="p-4 border-t border-slate-800 bg-slate-900/80">
+                    <form id="chat-form" onsubmit="sendMessage(event)" class="flex space-x-3">
+                        <input id="user-input" type="text" placeholder="Type a prompt to test caching behavior..." autocomplete="off" class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500">
+                        <button id="send-btn" type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition flex items-center space-x-1">
+                            <span>Send</span>
+                            <span>➤</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            async function sendMessage(e) {
+                e.preventDefault();
+                const input = document.getElementById('user-input');
+                const prompt = input.value.trim();
+                if (!prompt) return;
+
+                const apiKey = document.getElementById('api-key').value.trim();
+                const model = document.getElementById('model').value.trim();
+                const temperature = parseFloat(document.getElementById('temperature').value);
+                const bypass = document.getElementById('bypass-cache').checked;
+                const stream = document.getElementById('use-stream').checked;
+
+                input.value = '';
+                appendUserMessage(prompt);
+
+                const botMsgId = 'msg-' + Date.now();
+                const botBox = appendBotPlaceholder(botMsgId);
+
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + apiKey
+                };
+                if (bypass) headers['X-Bypass-Cache'] = 'true';
+
+                const payload = {
+                    model: model,
+                    messages: [{ role: 'user', content: prompt }],
+                    temperature: temperature,
+                    stream: stream
+                };
+
+                const t0 = performance.now();
+
+                try {
+                    const response = await fetch('/v1/chat/completions', {
+                        method: 'POST',
+                        headers: headers,
+                        body: JSON.stringify(payload)
+                    });
+
+                    const latencyMs = Math.round(performance.now() - t0);
+                    const cacheStatus = response.headers.get('X-Gateway-Cache-Status') || 'MISS';
+
+                    if (!response.ok) {
+                        const err = await response.json();
+                        botBox.innerHTML = `<span class="text-rose-400">Error ${response.status}: ${err.detail || 'Request failed'}</span>`;
+                        return;
+                    }
+
+                    if (stream) {
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let fullText = '';
+                        botBox.innerHTML = '';
+
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            const chunk = decoder.decode(value);
+                            const lines = chunk.split('\\n');
+                            for (const line of lines) {
+                                if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                                    try {
+                                        const parsed = JSON.parse(line.replace('data: ', ''));
+                                        const content = parsed.choices[0]?.delta?.content || '';
+                                        fullText += content;
+                                        botBox.innerText = fullText;
+                                    } catch(e) {}
+                                }
+                            }
+                        }
+                        updateBadge(botMsgId, cacheStatus, latencyMs);
+                    } else {
+                        const data = await response.json();
+                        botBox.innerText = data.choices[0].message.content;
+                        updateBadge(botMsgId, cacheStatus, latencyMs);
+                    }
+                } catch (err) {
+                    botBox.innerHTML = `<span class="text-rose-400">Network Error: ${err.message}</span>`;
+                }
+            }
+
+            function appendUserMessage(text) {
+                const feed = document.getElementById('chat-feed');
+                const div = document.createElement('div');
+                div.className = 'flex justify-end';
+                div.innerHTML = `<div class="bg-indigo-600/20 border border-indigo-500/30 text-indigo-100 rounded-2xl rounded-tr-sm px-4 py-2.5 max-w-xl text-sm leading-relaxed">${escapeHtml(text)}</div>`;
+                feed.appendChild(div);
+                feed.scrollTop = feed.scrollHeight;
+            }
+
+            function appendBotPlaceholder(id) {
+                const feed = document.getElementById('chat-feed');
+                const div = document.createElement('div');
+                div.className = 'flex flex-col space-y-1.5 items-start';
+                div.innerHTML = `
+                    <div id="badge-${id}" class="text-[11px] font-mono px-2.5 py-0.5 rounded-full inline-flex items-center space-x-1.5 bg-slate-800 text-slate-400 animate-pulse">
+                        ⏳ Routing through Aegis Gateway...
+                    </div>
+                    <div id="${id}" class="bg-slate-950 border border-slate-800 text-slate-100 rounded-2xl rounded-tl-sm px-4 py-3 max-w-2xl text-sm leading-relaxed whitespace-pre-wrap">Thinking...</div>
+                `;
+                feed.appendChild(div);
+                feed.scrollTop = feed.scrollHeight;
+                return document.getElementById(id);
+            }
+
+            function updateBadge(id, status, latency) {
+                const badge = document.getElementById(`badge-${id}`);
+                if (!badge) return;
+                badge.classList.remove('animate-pulse');
+
+                if (status.includes('L1_EXACT')) {
+                    badge.className = 'text-[11px] font-mono px-2.5 py-0.5 rounded-full inline-flex items-center space-x-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 shadow-sm';
+                    badge.innerHTML = `⚡ <b>L1 EXACT HIT</b> • ${latency}ms • Cost: $0.00 (Saved!)`;
+                } else if (status.includes('L2_SEMANTIC')) {
+                    badge.className = 'text-[11px] font-mono px-2.5 py-0.5 rounded-full inline-flex items-center space-x-1.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 shadow-sm';
+                    badge.innerHTML = `🧠 <b>L2 SEMANTIC MATCH</b> • ${latency}ms • Cost: $0.00 (Saved!)`;
+                } else {
+                    badge.className = 'text-[11px] font-mono px-2.5 py-0.5 rounded-full inline-flex items-center space-x-1.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 shadow-sm';
+                    badge.innerHTML = `🌐 <b>UPSTREAM MISS</b> • ${latency}ms • Cost: $0.003`;
+                }
+            }
+
+            async function purgeCache() {
+                if (!confirm("Are you sure you want to flush all L1/L2 caches and SQLite records?")) return;
+                try {
+                    const res = await fetch('/v1/gateway/cache', {
+                        method: 'DELETE',
+                        headers: { 'X-Admin-Key': 'admin-secret-key-12345' }
+                    });
+                    const data = await res.json();
+                    alert(data.message || 'Cache flushed');
+                } catch(e) {
+                    alert('Purge failed: ' + e);
+                }
+            }
+
+            function escapeHtml(str) {
+                return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+
+# --- Web UI: Operational Metrics Dashboard ---
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def live_dashboard():
@@ -213,9 +547,12 @@ async def live_dashboard():
             <header class="flex justify-between items-center border-b border-slate-800 pb-4">
                 <div>
                     <h1 class="text-3xl font-extrabold text-indigo-400 tracking-tight">AEGIS AI GATEWAY</h1>
-                    <p class="text-slate-400 text-sm mt-1">Multi-Tenant Semantic Reverse Proxy • ONNX Dense Cache • Rate Limiting • Circuit Breakers</p>
+                    <p class="text-slate-400 text-sm mt-1">Multi-Tenant Semantic Reverse Proxy • SQLite WAL • ONNX Dense Cache • Rate Limiter</p>
                 </div>
                 <div class="flex items-center space-x-3">
+                    <a href="/playground" class="text-xs px-3 py-1 rounded-full font-semibold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/30 transition">
+                        🎮 Open Playground
+                    </a>
                     <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
                         ● LIVE CLUSTER
                     </span>
