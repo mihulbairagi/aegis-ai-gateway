@@ -197,7 +197,13 @@ for chunk in stream:
 
 ## Verification & Automated Test Suite
 
-Aegis includes 11 automated unit and integration tests verifying all core subsystems:
+Aegis includes 27 automated production unit and integration tests verifying all core subsystems:
+- Multi-tenant partition isolation & dev-mode security gates
+- FastEmbed ONNX dense semantic caching & sweet-spot threshold
+- Pre-embedding lexical & typo normalization (human slips)
+- Post-embedding entity number, negation, and antonym polarity guards
+- Circuit breaker auto-failover, half-open probe limiting, and self-heal
+- SQLite WAL persistence, warmup, and TTL caps
 
 ```bash
 pytest tests/ -v
@@ -205,20 +211,18 @@ pytest tests/ -v
 
 Output:
 ```text
-tests/test_gateway.py::test_auth_and_unauthorized_rejection PASSED       [  9%]
-tests/test_gateway.py::test_admin_endpoint_protection PASSED             [ 18%]
-tests/test_gateway.py::test_multi_tenant_cache_isolation PASSED          [ 27%]
-tests/test_gateway.py::test_l2_semantic_cache_hit_true_dense_embeddings PASSED [ 36%]
-tests/test_gateway.py::test_dissimilar_queries_prevent_false_positives PASSED [ 45%]
-tests/test_gateway.py::test_full_sse_streaming_miss_and_hit PASSED       [ 54%]
-tests/test_gateway.py::test_sqlite_wal_persistence_and_warmup PASSED     [ 63%]
-tests/test_gateway.py::test_cache_bypass_header PASSED                   [ 72%]
-tests/test_gateway.py::test_rate_limiter_exceeded PASSED                 [ 81%]
-tests/test_gateway.py::test_circuit_breaker_auto_failover PASSED         [ 90%]
-tests/test_gateway.py::test_web_ui_endpoints PASSED                      [100%]
-
-======================== 11 passed in 6.21s ========================
+======================== 27 passed, 1 warning in 6.32s ========================
 ```
+
+---
+
+### Semantic Cache Precision & Entity Considerations
+Aegis couples high-dimensional dense embeddings (`all-MiniLM-L6-v2`) with a multi-factor **Post-Embedding Guard** covering:
+1. **Alphanumeric & Number-Word Integrity**: `500rs` vs `5000rs`, `10gb` vs `100gb`, `python3` vs `python2`, `five hundred` vs `five thousand`.
+2. **Explicit Negation Checking**: Rejects matches across `not`, `can't`, `never`, `without`.
+3. **24 Antonym Polarity Classes with Inflection**: Rejects opposing actions (`enable/disable`, `buy/sell`, `login/logout`, `turn on/turn off`).
+
+For queries involving sensitive role or domain entities (e.g. `admin` vs `user`), clients can enforce stricter matching via the dynamic `X-Similarity-Threshold: 0.88` header or bypass caching with `X-Bypass-Cache: true`.
 
 ---
 

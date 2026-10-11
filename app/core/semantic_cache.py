@@ -89,62 +89,104 @@ def normalize_text_for_embedding(text: str) -> str:
     return t.strip()
 
 
-# Antonym / opposing polarity pairs for semantic cache negation guard.
-# Prevents false positive cache hits between opposing boolean requests (e.g. enable 2FA vs disable 2FA).
+# --- Post-embedding guard -----------------------------------------------------------------
+# Dense embeddings pack "enable/disable", "500/5000", "can/can't" into near-identical vectors
+# (cosine 0.88-0.92 measured). After a vector match we therefore require that the two prompts
+# agree on: (1) every number-bearing token, (2) negation, (3) antonym polarity.
+
 POLARITY_PAIRS = [
-    ({"enable", "enabled", "enabling", "turn on", "activate", "activating"}, {"disable", "disabled", "disabling", "turn off", "deactivate", "deactivating"}),
-    ({"allow", "allowed", "allowing"}, {"deny", "denied", "denying", "block", "blocked", "blocking"}),
-    ({"start", "started", "starting"}, {"stop", "stopped", "stopping"}),
-    ({"increase", "increasing"}, {"decrease", "decreasing"}),
-    ({"add", "adding"}, {"remove", "removing", "delete", "deleting"}),
-    ({"connect", "connected"}, {"disconnect", "disconnected"}),
-    ({"lock", "locked"}, {"unlock", "unlocked"}),
-    ({"subscribe", "subscribing"}, {"unsubscribe", "unsubscribing"}),
-    ({"credit", "credited"}, {"debit", "debited"}),
-    ({"deposit", "depositing"}, {"withdraw", "withdrawing"}),
+    ({"enable", "activate"}, {"disable", "deactivate"}),
+    ({"allow", "permit", "grant"}, {"deny", "block", "revoke", "forbid"}),
+    ({"start", "begin"}, {"stop", "halt"}),
+    ({"pause"}, {"resume"}),
+    ({"increase", "raise"}, {"decrease", "reduce", "lower"}),
+    ({"add"}, {"remove", "delete"}),
+    ({"connect"}, {"disconnect"}),
+    ({"lock"}, {"unlock"}),
+    ({"subscribe"}, {"unsubscribe"}),
+    ({"credit"}, {"debit"}),
+    ({"deposit"}, {"withdraw"}),
+    ({"buy", "purchase"}, {"sell"}),
+    ({"open"}, {"close"}),
+    ({"upgrade"}, {"downgrade"}),
+    ({"show"}, {"hide"}),
+    ({"login", "signin"}, {"logout", "signout"}),
+    ({"send"}, {"receive"}),
+    ({"install"}, {"uninstall"}),
+    ({"encrypt"}, {"decrypt"}),
+    ({"import"}, {"export"}),
+    ({"mute"}, {"unmute"}),
+    ({"approve", "accept"}, {"reject", "decline"}),
+    ({"cancel"}, {"renew"}),
+    ({"on"}, {"off"}),
 ]
 
+_POLARITY_LOOKUP: Dict[str, Tuple[int, str]] = {}
+for _i, (_pos, _neg) in enumerate(POLARITY_PAIRS):
+    for _w in _pos:
+        _POLARITY_LOOKUP[_w] = (_i, "pos")
+    for _w in _neg:
+        _POLARITY_LOOKUP[_w] = (_i, "neg")
 
-def _extract_guard_features(text: str) -> Tuple[Set[str], Set[Tuple[int, str]]]:
-    """Extract numeric entities and polarity categories from query prompts."""
-    # Extract numbers (normalize out thousands separators e.g. 1,000 -> 1000)
-    raw_nums = re.findall(r'\b\d+(?:,\d+)*(?:\.\d+)?\b', text)
-    numbers = {num.replace(',', '') for num in raw_nums}
+_NEGATORS = {
+    "not", "no", "never", "cannot", "without", "nothing", "neither", "nor",
+    "cant", "dont", "doesnt", "didnt", "wont", "isnt", "arent", "wasnt", "werent",
+    "shouldnt", "couldnt", "wouldnt", "havent", "hasnt", "hadnt",
+}
+_NUMBER_WORDS = {
+    "zero", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
+    "ninety", "hundred", "thousand", "lakh", "lakhs", "crore", "crores", "million", "billion",
+    "half", "double", "triple",
+}
+_TOKEN_RE = re.compile(r"[a-z0-9]+(?:[.,][0-9]+)*")
+_PHRASAL_ON_OFF = re.compile(r"\b(?:turn|turning|switch|switching|toggle)\w*\s+(?:\w+\s+){0,2}?(on|off)\b")
 
+
+def _polarity_of(token: str):
+    """Look up a token, trying simple inflection stripping (enables/enabled/enabling -> enable)."""
+    if token in _POLARITY_LOOKUP:
+        return _POLARITY_LOOKUP[token]
+    cands = []
+    for suf, repl in (("ing", ""), ("ing", "e"), ("ed", ""), ("ed", "e"), ("es", ""), ("s", ""), ("d", "")):
+        if token.endswith(suf) and len(token) > len(suf) + 2:
+            cands.append(token[: -len(suf)] + repl)
+    for c in cands:
+        if c in _POLARITY_LOOKUP:
+            return _POLARITY_LOOKUP[c]
+    return None
+
+
+def _extract_guard_features(text: str):
+    """Returns (number_like_tokens, has_negation, polarity_set)."""
+    t = text.lower().replace("\u2019", "'").replace("'", "")
+    tokens = [x.replace(",", "") for x in _TOKEN_RE.findall(t)]
+    numbers = {x for x in tokens if any(ch.isdigit() for ch in x) or x in _NUMBER_WORDS}
+    has_neg = any(x in _NEGATORS for x in tokens)
     polarities: Set[Tuple[int, str]] = set()
-    text_lower = text.lower()
-    for i, (pos_set, neg_set) in enumerate(POLARITY_PAIRS):
-        for term in pos_set:
-            if re.search(r'\b' + re.escape(term) + r'\b', text_lower):
-                polarities.add((i, "pos"))
-                break
-        for term in neg_set:
-            if re.search(r'\b' + re.escape(term) + r'\b', text_lower):
-                polarities.add((i, "neg"))
-                break
-
-    return numbers, polarities
+    for x in tokens:
+        if x in ("on", "off"):
+            continue  # bare on/off is too ambiguous; only handled via phrasal forms below
+        pol = _polarity_of(x)
+        if pol:
+            polarities.add(pol)
+    for m in _PHRASAL_ON_OFF.finditer(t):
+        polarities.add((len(POLARITY_PAIRS) - 1, "pos" if m.group(1) == "on" else "neg"))
+    return numbers, has_neg, polarities
 
 
 def entity_and_polarity_guard(candidate_prompt: str, query_prompt: str) -> bool:
-    """
-    High-precision post-embedding guard for semantic cache verification.
-    Rejects hits with mismatched numeric entities (e.g. refund 500 vs 5000, transfer 10 vs 1000)
-    or contradictory antonym polarities (e.g. enable 2FA vs disable 2FA).
-    """
-    c_nums, c_pol = _extract_guard_features(candidate_prompt)
-    q_nums, q_pol = _extract_guard_features(query_prompt)
+    """True if the vector match may be served; False if the prompts differ in a meaning-critical way."""
+    c_nums, c_neg, c_pol = _extract_guard_features(candidate_prompt)
+    q_nums, q_neg, q_pol = _extract_guard_features(query_prompt)
 
-    # 1. Number integrity: if numbers are present, sets must be identical
-    if (c_nums or q_nums) and (c_nums != q_nums):
+    if c_nums != q_nums:          # 500 vs 5000, 10gb vs 100gb, python3 vs python2, A1234 vs A1243
         return False
-
-    # 2. Polarity integrity: opposing actions reject
-    for p in c_pol:
-        opp = (p[0], "neg" if p[1] == "pos" else "pos")
-        if opp in q_pol:
+    if c_neg != q_neg:            # "can log in" vs "can't log in"
+        return False
+    for idx, sign in c_pol:       # enable vs disable, buy vs sell, turn it on vs turn it off ...
+        if (idx, "neg" if sign == "pos" else "pos") in q_pol:
             return False
-
     return True
 
 

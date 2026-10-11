@@ -640,6 +640,38 @@ def test_entity_and_polarity_guard_prevents_false_positives():
     print("[PASS] test_entity_and_polarity_guard_prevents_false_positives")
 
 
+
+def test_guard_blocks_alnum_numbers_negation_and_extended_antonyms():
+    from app.core.semantic_cache import entity_and_polarity_guard as g
+    must_reject = [
+        ("transfer 500rs to rahul", "transfer 5000rs to rahul"),
+        ("upgrade to 10gb plan", "upgrade to 100gb plan"),
+        ("raise limit to 10k", "raise limit to 100k"),
+        ("install python3", "install python2"),
+        ("track order A1234", "track order A1243"),
+        ("refund order five hundred", "refund order five thousand"),
+        ("how do I enable 2FA", "how do I not enable 2FA"),
+        ("I can log in", "I can't log in"),
+        ("how to turn it on", "how to turn it off"),
+        ("how to turn on notifications", "how to switch off notifications"),
+        ("how do I buy shares", "how do I sell shares"),
+        ("pause my subscription", "resume my subscription"),
+        ("upgrade my plan", "downgrade my plan"),
+        ("login to my account", "logout of my account"),
+        ("how do I enables 2FA", "how do I disables 2FA"),
+    ]
+    for a, b in must_reject:
+        assert not g(a, b), f"guard leaked: {a!r} vs {b!r}"
+        assert not g(b, a), f"guard leaked (reverse): {b!r} vs {a!r}"
+    must_pass = [
+        ("how do I reset my password", "steps to reset forgotten password"),
+        ("transfer 1,000 rupees", "transfer 1000 rupees"),
+        ("which one is cheaper", "what is the cheaper option"),
+        ("how do I enable 2FA", "steps to enable 2FA on my account"),
+    ]
+    for a, b in must_pass:
+        assert g(a, b), f"guard over-rejected: {a!r} vs {b!r}"
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -667,6 +699,7 @@ if __name__ == "__main__":
     test_metrics_poll_does_not_consume_half_open_probe()
     test_half_open_probe_released_without_verdict_and_self_heals()
     test_entity_and_polarity_guard_prevents_false_positives()
-    print("\nALL 26 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_guard_blocks_alnum_numbers_negation_and_extended_antonyms()
+    print("\nALL 27 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 
