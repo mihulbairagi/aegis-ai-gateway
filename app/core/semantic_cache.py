@@ -122,6 +122,20 @@ class TenantL2Partition:
         self.timestamps.clear()
         self.ttls.clear()
 
+    def purge_expired(self, now: float) -> int:
+        """Drops entries whose TTL elapsed. Returns how many were removed."""
+        keep = [i for i in range(len(self.vectors)) if now - self.timestamps[i] <= self.ttls[i]]
+        removed = len(self.vectors) - len(keep)
+        if removed:
+            self.vectors = [self.vectors[i] for i in keep]
+            self.entries = [self.entries[i] for i in keep]
+            self.prompts = [self.prompts[i] for i in keep]
+            self.models = [self.models[i] for i in keep]
+            self.temperatures = [self.temperatures[i] for i in keep]
+            self.timestamps = [self.timestamps[i] for i in keep]
+            self.ttls = [self.ttls[i] for i in keep]
+        return removed
+
 
 class SemanticCache:
     """
@@ -157,10 +171,15 @@ class SemanticCache:
 
     def warmup(self):
         """Warm up in-memory indices from persistent SQLite storage on process start."""
+        # Timestamps are wall-clock epoch seconds so TTLs survive restarts/reboots
+        # (time.monotonic() resets at boot and made old entries look "from the future").
+        now = time.time()
+        sqlite_storage.delete_expired(now)
         records = sqlite_storage.load_all_records()
-        now = time.monotonic()
         for r in records:
             try:
+                if now - float(r["created_at"]) > float(r["ttl"]):
+                    continue  # expired while the process was down
                 resp_data = json.loads(r["response_json"])
                 resp = ChatCompletionResponse.model_validate(resp_data)
                 tenant_id = r["tenant_id"]
@@ -217,7 +236,7 @@ class SemanticCache:
         if bypass_cache:
             return None, None, 0.0
 
-        now = time.monotonic()
+        now = time.time()
         effective_threshold = (
             custom_threshold
             if custom_threshold is not None and 0.5 <= custom_threshold <= 1.0
@@ -289,8 +308,9 @@ class SemanticCache:
         if bypass_cache:
             return
 
-        now = time.monotonic()
+        now = time.time()
         ttl = ttl_seconds if ttl_seconds is not None and ttl_seconds > 0 else self.default_ttl
+        ttl = min(ttl, settings.CACHE_MAX_TTL_SECONDS)
         prompt_text = self._extract_prompt_text(request)
         req_temp = request.temperature if request.temperature is not None else 0.0
 
@@ -329,6 +349,21 @@ class SemanticCache:
             now,
             ttl
         ))
+
+    async def purge_expired(self) -> int:
+        """Removes expired entries from L1, every L2 partition and SQLite (called periodically)."""
+        now = time.time()
+        removed = 0
+
+        for key in [k for k, (_, created_at, ttl) in self.l1_cache.items() if now - created_at > ttl]:
+            del self.l1_cache[key]
+            removed += 1
+
+        for partition in self.l2_partitions.values():
+            removed += partition.purge_expired(now)
+
+        removed += await asyncio.to_thread(sqlite_storage.delete_expired, now)
+        return removed
 
     def clear(self):
         """Flushes all tenant L1 and L2 caches and clears SQLite database."""

@@ -6,6 +6,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Tests use dev tenant keys and mock admin key
+os.environ.setdefault("AEGIS_DEV_MODE", "true")
+os.environ.setdefault("ADMIN_API_KEY", "test-admin-key-not-for-production-0123456789")
+
 from fastapi.testclient import TestClient
 from app.main import app
 from app.config import settings, get_active_provider_info
@@ -18,7 +22,7 @@ client = TestClient(app)
 
 ALPHA_HEADERS = {"Authorization": "Bearer sk-aegis-tenant-alpha"}
 BETA_HEADERS = {"Authorization": "Bearer sk-aegis-tenant-beta"}
-ADMIN_HEADERS = {"X-Admin-Key": "admin-secret-key-12345"}
+ADMIN_HEADERS = {"X-Admin-Key": settings.ADMIN_API_KEY}
 
 def reset_state():
     """Clear caches, SQLite records, and state before each test."""
@@ -366,6 +370,106 @@ def test_custom_threshold_override():
     print("[PASS] test_custom_threshold_override")
 
 
+# ---------------------------------------------------------------------------
+# Security / TTL regression tests
+# ---------------------------------------------------------------------------
+
+def _wait_for_record(fragment: str, timeout: float = 5.0):
+    """SQLite persistence is a fire-and-forget background task; poll until the row shows up."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        recs = [r for r in sqlite_storage.load_all_records() if fragment in r["prompt"]]
+        if recs:
+            return recs
+        time.sleep(0.05)
+    return []
+
+
+def test_playground_does_not_leak_admin_key():
+    """The public /playground page must never embed the admin key."""
+    res = client.get("/playground")
+    assert res.status_code == 200
+    assert settings.ADMIN_API_KEY not in res.text
+    assert "admin-secret-key-12345" not in res.text
+
+
+def test_old_default_admin_key_rejected():
+    """The previously hardcoded admin key must no longer work."""
+    res = client.delete("/v1/gateway/cache", headers={"X-Admin-Key": "admin-secret-key-12345"})
+    assert res.status_code == 403
+    res = client.delete("/v1/gateway/cache", headers={"X-Admin-Key": ""})
+    assert res.status_code in (401, 403)
+
+
+def test_dev_keys_and_admin_default_disabled_without_env():
+    """Without AEGIS_DEV_MODE / ADMIN_API_KEY, no well-known keys are accepted."""
+    import subprocess
+    code = (
+        "from app.config import authenticate_tenant, verify_admin_key;"
+        "assert authenticate_tenant('sk-aegis-tenant-alpha') is None;"
+        "assert not verify_admin_key('admin-secret-key-12345');"
+        "assert not verify_admin_key('change-me');"
+        "print('ok')"
+    )
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("AEGIS_DEV_MODE", "ADMIN_API_KEY", "TENANT_API_KEYS")}
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "ok" in out.stdout
+
+
+def test_expired_entries_not_served_after_restart():
+    """TTL uses wall-clock time, so entries that expired while 'down' are dropped on warmup."""
+    reset_state()
+    payload = {"model": "gpt-4o-mini",
+               "messages": [{"role": "user", "content": "Expiry across restart check"}]}
+    # Context-managed client = one long-lived event loop (like uvicorn), so the
+    # fire-and-forget SQLite write is not cancelled when the request finishes.
+    with TestClient(app) as c:
+        res = c.post("/v1/chat/completions", json=payload,
+                     headers={**ALPHA_HEADERS, "X-Cache-TTL": "1"})
+        assert res.status_code == 200
+        assert _wait_for_record("Expiry across restart"), "row was never persisted"
+
+        time.sleep(1.2)  # entry is now past its TTL
+
+        semantic_cache.l1_cache.clear()
+        for p in semantic_cache.l2_partitions.values():
+            p.clear()
+        semantic_cache.warmup()
+
+        res2 = c.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+        assert res2.status_code == 200
+        assert not res2.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+
+def test_purge_expired_removes_sqlite_rows():
+    import asyncio
+    reset_state()
+    payload = {"model": "gpt-4o-mini",
+               "messages": [{"role": "user", "content": "Purge me soon"}]}
+    with TestClient(app) as c:
+        c.post("/v1/chat/completions", json=payload, headers={**ALPHA_HEADERS, "X-Cache-TTL": "1"})
+        assert _wait_for_record("Purge me soon"), "row was never persisted"
+    time.sleep(1.3)
+    asyncio.run(semantic_cache.purge_expired())
+    assert not any("Purge me soon" in r["prompt"] for r in sqlite_storage.load_all_records())
+
+
+def test_client_ttl_is_capped():
+    reset_state()
+    payload = {"model": "gpt-4o-mini",
+               "messages": [{"role": "user", "content": "TTL cap check"}]}
+    with TestClient(app) as c:
+        res = c.post("/v1/chat/completions", json=payload,
+                     headers={**ALPHA_HEADERS, "X-Cache-TTL": "999999999"})
+        assert res.status_code == 200
+        recs = _wait_for_record("TTL cap check")
+    assert recs and all(r["ttl"] <= settings.CACHE_MAX_TTL_SECONDS for r in recs)
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -380,5 +484,11 @@ if __name__ == "__main__":
     test_rate_limiter_exceeded()
     test_circuit_breaker_auto_failover()
     test_web_ui_endpoints()
-    print("\nALL 13 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_playground_does_not_leak_admin_key()
+    test_old_default_admin_key_rejected()
+    test_dev_keys_and_admin_default_disabled_without_env()
+    test_expired_entries_not_served_after_restart()
+    test_purge_expired_removes_sqlite_rows()
+    test_client_ttl_is_capped()
+    print("\nALL 19 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 

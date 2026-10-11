@@ -11,7 +11,12 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ROUTERPLUS_API_KEY=${ROUTERPLUS_API_KEY:-}
-      - ADMIN_API_KEY=${ADMIN_API_KEY:-admin-secret-key-12345}
+      # No default on purpose: compose refuses to start until a real admin key is provided.
+      - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in your .env (long random string)}
+      # Format: "sk-key-one:tenant-a,sk-key-two:tenant-b"
+      - TENANT_API_KEYS=${TENANT_API_KEYS:-}
+      # Publicly known dev keys; keep false anywhere except local demos.
+      - AEGIS_DEV_MODE=${AEGIS_DEV_MODE:-false}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

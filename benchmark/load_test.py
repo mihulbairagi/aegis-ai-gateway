@@ -13,7 +13,9 @@ if hasattr(sys.stdout, "reconfigure"):
 console = Console()
 
 GATEWAY_URL = "http://127.0.0.1:8000"
-BENCHMARK_API_KEY = "sk-aegis-benchmark"
+# Use your own tenant key via BENCHMARK_API_KEY; the fallback is the public dev key (needs AEGIS_DEV_MODE=true on the server).
+import os
+BENCHMARK_API_KEY = os.getenv("BENCHMARK_API_KEY", "sk-aegis-benchmark")
 BENCHMARK_HEADERS = {"Authorization": f"Bearer {BENCHMARK_API_KEY}"}
 
 # Real-world semantic paraphrases (no regex hacks, pure contextual transformer pairs)
@@ -36,7 +38,7 @@ async def run_benchmark(total_requests: int = 150, concurrency: int = 25):
     console.print(Panel.fit(
         "[bold cyan]AEGIS AI GATEWAY: MULTI-TENANT PRODUCTION BENCHMARK[/bold cyan]\n"
         f"Simulating [bold yellow]{total_requests} requests[/bold yellow] across [bold yellow]{concurrency} concurrent workers[/bold yellow]\n"
-        f"Tenant Auth: [bold green]sk-aegis-benchmark[/bold green] • Model: [bold green]all-MiniLM-L6-v2 ONNX CPU[/bold green]",
+        f"Tenant Auth: [bold green]{BENCHMARK_API_KEY[:8]}…[/bold green] • Model: [bold green]all-MiniLM-L6-v2 ONNX CPU[/bold green]",
         border_style="cyan"
     ))
 

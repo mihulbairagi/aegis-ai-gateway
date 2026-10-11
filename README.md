@@ -94,12 +94,27 @@ flowchart TD
 * **Strict Tenant Scoping**: Prevents cross-tenant data leakage (Tenant-B can NEVER receive Tenant-A's cached responses).
 * **Tier-1 Exact LRU**: Keyed by `(tenant_id, model, temperature, SHA256(prompt))`.
 * **Tier-2 Semantic Partitions**: Vector embeddings are strictly indexed and queried within dedicated per-tenant memory partitions.
-* **Per-Entry TTL Expiry**: Each cached entry stores a monotonic timestamp and TTL (default 300s, configurable via `X-Cache-TTL`).
+* **Per-Entry TTL Expiry**: Each cached entry stores a wall-clock (epoch) timestamp and TTL (default 300s, configurable via `X-Cache-TTL`, capped by `CACHE_MAX_TTL_SECONDS`). Expired entries are purged from memory and SQLite every 60s and on startup.
 * **On-Demand Cache Bypass**: Honors `X-Bypass-Cache: true` and `Cache-Control: no-cache` for real-time transactional flows.
 
 ---
 
 ## Quickstart & Installation
+
+### Security configuration (read first)
+
+The gateway ships with **no default credentials**:
+
+| Variable | Purpose |
+|---|---|
+| `ADMIN_API_KEY` | Protects `/v1/gateway/*` admin endpoints. If unset (or `change-me`), admin endpoints are disabled. |
+| `TENANT_API_KEYS` | Client keys as `key:tenant` pairs, e.g. `sk-abc123...:tenant-a,sk-def456...:tenant-b`. |
+| `AEGIS_DEV_MODE` | `true` enables publicly known dev keys (`sk-aegis-tenant-alpha`, ...) for **local demos only**. |
+
+```bash
+cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # use for ADMIN_API_KEY and each tenant key
+```
 
 ### Option 1: Local CLI Installation (Recommended)
 
@@ -110,13 +125,14 @@ cd aegis-ai-gateway
 # Install dependencies and CLI entrypoint
 pip install -e .
 
-# Launch Aegis Gateway
-aegis start --port 8000
+# Launch Aegis Gateway (local demo mode: enables the public dev keys)
+AEGIS_DEV_MODE=true aegis start --port 8000
 ```
 
 ### Option 2: Docker Compose (1-Click Container)
 
 ```bash
+# Requires ADMIN_API_KEY (and TENANT_API_KEYS) in .env; compose refuses to start without ADMIN_API_KEY
 docker compose up -d
 ```
 
@@ -139,7 +155,7 @@ aegis start --host 127.0.0.1 --port 8000 --reload
 aegis status
 
 # Purge all in-memory and SQLite cache records
-aegis flush --admin-key admin-secret-key-12345
+aegis flush --admin-key "$ADMIN_API_KEY"
 
 # Execute 150-request concurrent load benchmark
 aegis benchmark --requests 150 --concurrency 25
@@ -153,7 +169,7 @@ aegis benchmark --requests 150 --concurrency 25
 Configure your extension's custom OpenAI settings:
 - **Provider**: `OpenAI-Compatible`
 - **Base URL**: `http://localhost:8000/v1`
-- **API Key**: `sk-aegis-tenant-alpha`
+- **API Key**: one of your `TENANT_API_KEYS` (demo mode only: `sk-aegis-tenant-alpha`)
 - **Model**: `gpt-4o-mini` (or your chosen model)
 
 ### 2. Python OpenAI SDK (Drop-In)
@@ -163,7 +179,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="sk-aegis-tenant-alpha"
+    api_key="YOUR_TENANT_API_KEY"  # demo mode only: sk-aegis-tenant-alpha
 )
 
 # Streaming completion

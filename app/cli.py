@@ -82,7 +82,7 @@ def main():
     # Command: flush
     flush_parser = subparsers.add_parser("flush", help="Purge all in-memory and SQLite cache records")
     flush_parser.add_argument("--url", default="http://127.0.0.1:8000", help="Gateway URL")
-    flush_parser.add_argument("--admin-key", default="admin-secret-key-12345", help="Admin API Key")
+    flush_parser.add_argument("--admin-key", default=os.getenv("ADMIN_API_KEY"), help="Admin API Key (default: $ADMIN_API_KEY)")
 
     # Command: status
     status_parser = subparsers.add_parser("status", help="Display live gateway operational telemetry")
@@ -101,6 +101,9 @@ def main():
         reload = getattr(args, "reload", False)
         start_server(host=host, port=port, reload=reload)
     elif args.command == "flush":
+        if not args.admin_key:
+            console.print("[bold red]✘ No admin key.[/bold red] Pass --admin-key or set the ADMIN_API_KEY environment variable.")
+            sys.exit(1)
         flush_cache(url=args.url, admin_key=args.admin_key)
     elif args.command == "status":
         check_status(url=args.url)

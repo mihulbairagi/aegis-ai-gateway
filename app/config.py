@@ -1,10 +1,32 @@
 import os
 import hashlib
+import hmac
+import logging
+import secrets
 from typing import Dict, Optional, Any
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_logger = logging.getLogger("aegis.config")
+
+# Values that must never be accepted as a real admin key (old defaults / template placeholders).
+_PLACEHOLDER_ADMIN_KEYS = {"", "change-me", "admin-secret-key-12345", "your-admin-key-here"}
+
+
+def _resolve_admin_key() -> str:
+    """Reads ADMIN_API_KEY from the environment. If it is missing or still a placeholder,
+    generates a random ephemeral key, which effectively disables the admin endpoints
+    until a real key is configured (secure by default, no hardcoded fallback)."""
+    key = os.getenv("ADMIN_API_KEY", "").strip()
+    if key.lower() in _PLACEHOLDER_ADMIN_KEYS:
+        _logger.warning(
+            "ADMIN_API_KEY is not set (or is a placeholder). Admin endpoints are disabled "
+            "until you set a long random ADMIN_API_KEY in the environment."
+        )
+        return secrets.token_urlsafe(32)
+    return key
 
 class GatewaySettings(BaseModel):
     # Gateway Server
@@ -37,14 +59,16 @@ class GatewaySettings(BaseModel):
     FALLBACK_MODEL: str = os.getenv("FALLBACK_MODEL", "gemini-2.0-flash")
 
     # Admin & Authentication Security
-    ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "admin-secret-key-12345")
-    
+    ADMIN_API_KEY: str = _resolve_admin_key()
+
     # Caching Settings
     L1_CACHE_MAX_ITEMS: int = int(os.getenv("L1_CACHE_MAX_ITEMS", "1000"))
     L2_SEMANTIC_CACHE_MAX_ITEMS: int = int(os.getenv("L2_SEMANTIC_CACHE_MAX_ITEMS", "5000"))
     SEMANTIC_SIMILARITY_THRESHOLD: float = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.80"))
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     CACHE_DEFAULT_TTL_SECONDS: float = float(os.getenv("CACHE_DEFAULT_TTL_SECONDS", "300.0"))
+    # Upper bound for the client-controlled X-Cache-TTL header (default 24h)
+    CACHE_MAX_TTL_SECONDS: float = float(os.getenv("CACHE_MAX_TTL_SECONDS", "86400.0"))
 
     # Rate Limiting Settings
     DEFAULT_RATE_LIMIT_RPS: int = int(os.getenv("DEFAULT_RATE_LIMIT_RPS", "20"))
@@ -90,20 +114,38 @@ def get_active_provider_info() -> Dict[str, str]:
             "default_model": settings.ROUTERPLUS_MODEL
         }
 
-# Multi-tenant API key hash registry (Pre-configured tenants: alpha, beta, benchmark, test)
-RAW_TENANT_KEYS: Dict[str, str] = {
+# Multi-tenant API key registry.
+# Production keys come ONLY from the environment:  TENANT_API_KEYS="sk-key-one:tenant-a,sk-key-two:tenant-b"
+# Well-known dev keys exist only when AEGIS_DEV_MODE=true (local demos / tests), never by default.
+DEV_MODE: bool = os.getenv("AEGIS_DEV_MODE", "false").strip().lower() == "true"
+
+_DEV_TENANT_KEYS: Dict[str, str] = {
     "sk-aegis-tenant-alpha": "tenant-alpha",
     "sk-aegis-tenant-beta": "tenant-beta",
     "sk-aegis-benchmark": "tenant-benchmark",
     "sk-aegis-test": "tenant-test",
 }
 
+RAW_TENANT_KEYS: Dict[str, str] = {}
+
+if DEV_MODE:
+    RAW_TENANT_KEYS.update(_DEV_TENANT_KEYS)
+    _logger.warning("AEGIS_DEV_MODE=true: publicly known dev tenant keys are ENABLED. Never use this in production.")
+
 _env_tenant_keys = os.getenv("TENANT_API_KEYS", "")
 if _env_tenant_keys:
     for pair in _env_tenant_keys.split(","):
         if ":" in pair:
             k, t = pair.strip().split(":", 1)
-            RAW_TENANT_KEYS[k.strip()] = t.strip()
+            # Skip empty entries and the unedited template placeholder from .env.example
+            if k.strip() and t.strip() and "replace-me" not in k.lower():
+                RAW_TENANT_KEYS[k.strip()] = t.strip()
+
+if not RAW_TENANT_KEYS:
+    _logger.warning(
+        "No tenant API keys configured: every /v1/chat/completions request will return 401. "
+        "Set TENANT_API_KEYS (or AEGIS_DEV_MODE=true for local demos)."
+    )
 
 TENANT_KEY_HASH_MAP: Dict[str, str] = {
     hashlib.sha256(key.encode()).hexdigest(): tenant_id
@@ -121,4 +163,7 @@ def verify_admin_key(admin_key: str) -> bool:
     """Validates admin API key for protected gateway operations."""
     if not admin_key or not settings.ADMIN_API_KEY:
         return False
-    return admin_key.strip() == settings.ADMIN_API_KEY.strip()
+    return hmac.compare_digest(
+        admin_key.strip().encode("utf-8"),
+        settings.ADMIN_API_KEY.strip().encode("utf-8"),
+    )

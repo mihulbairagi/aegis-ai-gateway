@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
             try:
                 await asyncio.sleep(60.0)
                 rate_limiter.cleanup_stale_buckets(ttl_seconds=1800.0)
+                await semantic_cache.purge_expired()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -47,7 +48,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # auth uses headers, not cookies; wildcard origin + credentials is invalid/unsafe
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -86,7 +87,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     if not tenant_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Invalid or missing client API key. Pre-configured dev keys include: 'sk-aegis-tenant-alpha', 'sk-aegis-tenant-beta', 'sk-aegis-test', 'sk-aegis-benchmark'."
+            detail="Unauthorized: Invalid or missing client API key."
         )
 
     # 2. Rate Limiting (Token Bucket per tenant)
@@ -105,7 +106,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
         request.headers.get("Cache-Control", "").lower() == "no-cache"
     )
     raw_ttl = request.headers.get("X-Cache-TTL")
-    custom_ttl = float(raw_ttl) if raw_ttl and raw_ttl.isdigit() else None
+    custom_ttl = (
+        min(float(raw_ttl), settings.CACHE_MAX_TTL_SECONDS)
+        if raw_ttl and raw_ttl.isdigit() and float(raw_ttl) > 0
+        else None
+    )
 
     # Dynamic threshold override from request header or body
     raw_thresh = request.headers.get("X-Similarity-Threshold")
@@ -337,7 +342,12 @@ async def interactive_playground():
                 
                 <div>
                     <label class="text-xs text-slate-400 block mb-1">Tenant API Key</label>
-                    <input id="api-key" type="password" value="sk-aegis-tenant-alpha" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
+                    <input id="api-key" type="password" placeholder="sk-your-tenant-key" autocomplete="off" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
+                </div>
+
+                <div>
+                    <label class="text-xs text-slate-400 block mb-1">Admin Key (only for Purge Cache)</label>
+                    <input id="admin-key" type="password" placeholder="ADMIN_API_KEY" autocomplete="off" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
                 </div>
 
                 <div>
@@ -534,14 +544,16 @@ async def interactive_playground():
             }
 
             async function purgeCache() {
+                const adminKey = document.getElementById('admin-key').value.trim();
+                if (!adminKey) { alert('Enter the admin key in the sidebar first.'); return; }
                 if (!confirm("Are you sure you want to flush all L1/L2 caches and SQLite records?")) return;
                 try {
                     const res = await fetch('/v1/gateway/cache', {
                         method: 'DELETE',
-                        headers: { 'X-Admin-Key': 'admin-secret-key-12345' }
+                        headers: { 'X-Admin-Key': adminKey }
                     });
                     const data = await res.json();
-                    alert(data.message || 'Cache flushed');
+                    alert(data.message || data.detail || 'Cache flushed');
                 } catch(e) {
                     alert('Purge failed: ' + e);
                 }

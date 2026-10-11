@@ -123,6 +123,22 @@ class SQLiteCacheStorage:
         except Exception:
             pass
 
+    def delete_expired(self, now_epoch: float) -> int:
+        """Deletes rows whose TTL has elapsed (created_at + ttl < now). Timestamps are
+        wall-clock epoch seconds (time.time()), so they stay valid across process restarts
+        and reboots. Returns the number of deleted rows."""
+        try:
+            with self._get_connection() as conn:
+                cur = conn.execute(
+                    "DELETE FROM semantic_cache WHERE created_at + ttl < ?",
+                    (now_epoch,),
+                )
+                conn.commit()
+                return cur.rowcount or 0
+        except Exception as e:
+            logger.error(f"SQLite delete_expired failed: {e}")
+            return 0
+
     def clear(self):
         """Purges all records from SQLite."""
         try:
