@@ -52,6 +52,7 @@ class UpstreamProxy:
             except httpx.HTTPStatusError as e:
                 # 4xx client errors MUST NOT trip the circuit breaker
                 if 400 <= e.response.status_code < 500:
+                    circuit_breaker.release_probe()
                     raise HTTPException(
                         status_code=e.response.status_code,
                         detail=f"Upstream provider client error ({e.response.status_code}): {e.response.text[:200]}"
@@ -94,20 +95,30 @@ class UpstreamProxy:
                 }
 
                 async def live_stream_generator():
+                    settled = False  # did we report a success/failure verdict to the breaker?
                     try:
                         async with self.client.stream("POST", url, headers=headers, json=payload) as resp:
                             if resp.status_code >= 400:
                                 error_text = await resp.aread()
+                                if resp.status_code >= 500:
+                                    circuit_breaker.record_failure()
+                                    settled = True
                                 yield f"data: {json.dumps({'error': error_text.decode('utf-8', errors='ignore')})}\n\n"
                                 return
                             circuit_breaker.record_success()
+                            settled = True
                             async for line in resp.aiter_lines():
                                 if line:
                                     yield f"{line}\n\n"
                     except Exception as exc:
-                        circuit_breaker.record_failure()
+                        if not settled:
+                            circuit_breaker.record_failure()
+                            settled = True
                         yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                         yield "data: [DONE]\n\n"
+                    finally:
+                        if not settled:  # 4xx, client disconnect, cancellation
+                            circuit_breaker.release_probe()
 
                 return live_stream_generator(), f"{active['name']}_stream"
             except Exception:

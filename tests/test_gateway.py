@@ -555,6 +555,45 @@ def test_lexical_typo_normalization_cache_hit():
     print("[PASS] test_lexical_typo_normalization_cache_hit")
 
 
+
+# ---------------------------------------------------------------------------
+# Regression tests: normalizer corruption + circuit breaker wedge
+# ---------------------------------------------------------------------------
+
+def test_normalizer_preserves_numbers_and_distinct_words():
+    from app.core.semantic_cache import normalize_text_for_embedding as n
+    assert n("Transfer 1000 rupees") != n("Transfer 10 rupees")
+    assert n("Refund order 5000") != n("Refund order 50")
+    assert n("order id 7777") != n("order id 7")
+    assert n("show me the stats") != n("show me the status")
+    assert n("pleaaase help") == "please help"  # intended letter-collapse still works
+
+
+def test_metrics_poll_does_not_consume_half_open_probe():
+    reset_state()
+    for _ in range(3):
+        circuit_breaker.record_failure()
+    circuit_breaker.last_state_change = time.monotonic() - (circuit_breaker.recovery_timeout + 5.0)
+    for _ in range(5):
+        assert client.get("/metrics").status_code == 200
+    assert circuit_breaker.inflight_probes == 0
+    # a real request must still be able to take the probe slot
+    route, _ = circuit_breaker.get_route()
+    assert route == "primary"
+
+
+def test_half_open_probe_released_without_verdict_and_self_heals():
+    reset_state()
+    for _ in range(3):
+        circuit_breaker.record_failure()
+    circuit_breaker.last_state_change = time.monotonic() - (circuit_breaker.recovery_timeout + 5.0)
+    assert circuit_breaker.get_route()[0] == "primary"      # probe taken
+    circuit_breaker.release_probe()                          # 4xx / disconnect path
+    assert circuit_breaker.get_route()[0] == "primary"      # slot is free again
+    # probe that never reports back: breaker must self-heal after recovery_timeout
+    circuit_breaker.last_probe_time = time.monotonic() - (circuit_breaker.recovery_timeout + 1.0)
+    assert circuit_breaker.get_route()[0] == "primary"
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -578,6 +617,9 @@ if __name__ == "__main__":
     test_purge_expired_removes_sqlite_rows()
     test_client_ttl_is_capped()
     test_lexical_typo_normalization_cache_hit()
-    print("\nALL 22 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_normalizer_preserves_numbers_and_distinct_words()
+    test_metrics_poll_does_not_consume_half_open_probe()
+    test_half_open_probe_released_without_verdict_and_self_heals()
+    print("\nALL 25 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 

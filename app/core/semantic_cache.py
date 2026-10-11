@@ -32,7 +32,7 @@ LEXICAL_NORMALIZATION_MAP: Dict[str, str] = {
     "cancle": "cancel", "cancell": "cancel", "cancled": "canceled", "cancl": "cancel",
     "cancelling": "canceling",
     # Account typos
-    "accout": "account", "acount": "account", "acnt": "account", "acc": "account", "acct": "account",
+    "accout": "account", "acount": "account", "acnt": "account", "acct": "account",
     # Delete typos
     "dlete": "delete", "delte": "delete", "delt": "delete",
     # Update typos
@@ -50,14 +50,14 @@ LEXICAL_NORMALIZATION_MAP: Dict[str, str] = {
     # Delivery typos
     "delivry": "delivery", "delvery": "delivery", "dlvry": "delivery",
     # Status typos
-    "sttus": "status", "statuss": "status", "stats": "status",
+    "sttus": "status", "statuss": "status",
     # Common service brands
     "swigy": "swiggy", "swigi": "swiggy",
     "zomto": "zomato", "zomatto": "zomato",
     # Chat slang & quick abbreviations
     "hw": "how", "wat": "what", "wht": "what",
     "plz": "please", "pls": "please",
-    "u": "you", "ur": "your", "r": "are",
+    "ur": "your",
     "bcz": "because", "cuz": "because", "coz": "because",
     "hlp": "help", "thx": "thanks", "thanx": "thanks", "tnx": "thanks",
 }
@@ -71,8 +71,9 @@ def normalize_text_for_embedding(text: str) -> str:
     """
     t = text.lower().strip()
     t = re.sub(r'^(user|system|assistant|tool):\s*', '', t)
-    # Deduplicate 3+ repeated characters (e.g. 'pleaaase' -> 'please', 'soooo' -> 'so')
-    t = re.sub(r'(\w)\1{2,}', r'\1', t)
+    # Deduplicate 3+ repeated LETTERS only (e.g. 'pleaaase' -> 'please'). Never digits/underscores:
+    # '1000' must not collapse to '10', or different amounts/IDs share one cached answer.
+    t = re.sub(r'([^\W\d_])\1{2,}', r'\1', t)
     words = t.split()
     normalized_words = []
     for w in words:

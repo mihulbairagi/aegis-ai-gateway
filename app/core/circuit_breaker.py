@@ -30,6 +30,16 @@ class CircuitBreaker:
         self.last_state_change = time.monotonic()
         self.last_failure_time = 0.0
         self.inflight_probes = 0
+        self.last_probe_time = 0.0
+
+    def peek_state(self) -> CircuitState:
+        """Read-only view of the state (no transitions, no probe slot consumed). Use for /metrics."""
+        return self.state
+
+    def release_probe(self):
+        """Free a HALF_OPEN probe slot when a request ends without a success/failure verdict
+        (4xx, client disconnect, cancelled stream)."""
+        self.inflight_probes = max(0, self.inflight_probes - 1)
 
     def get_route(self) -> Tuple[str, CircuitState]:
         """
@@ -44,13 +54,18 @@ class CircuitBreaker:
                 self.last_state_change = now
                 self.consecutive_successes = 0
                 self.inflight_probes = 1
+                self.last_probe_time = now
                 return "primary", self.state
             return "fallback", self.state
 
         elif self.state == CircuitState.HALF_OPEN:
             # Only permit up to half_open_max_probes to primary; excess traffic routes safely to fallback
+            # Self-heal: a probe that never reported back must not wedge the breaker forever.
+            if self.inflight_probes > 0 and (time.monotonic() - self.last_probe_time) > self.recovery_timeout:
+                self.inflight_probes = 0
             if self.inflight_probes < self.half_open_max_probes:
                 self.inflight_probes += 1
+                self.last_probe_time = time.monotonic()
                 return "primary", self.state
             return "fallback", self.state
 
@@ -94,6 +109,7 @@ class CircuitBreaker:
         self.consecutive_failures = 0
         self.consecutive_successes = 0
         self.inflight_probes = 0
+        self.last_probe_time = 0.0
         self.last_state_change = time.monotonic()
         self.last_failure_time = 0.0
 

@@ -280,7 +280,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
 @app.get("/metrics", response_model=GatewayMetricsResponse)
 async def get_metrics():
     summary = metrics_tracker.get_summary()
-    route, state = circuit_breaker.get_route()
+    # Read-only: get_route() has side effects (state transition + probe slot), never call it from telemetry.
+    state = circuit_breaker.peek_state()
+    route = "fallback" if state == CircuitState.OPEN else "primary"
     provider_info = get_active_provider_info()
     summary["circuit_breaker_state"] = state.value
     summary["active_provider"] = f"{provider_info['name']} ({route})"
