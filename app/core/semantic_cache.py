@@ -207,16 +207,22 @@ class SemanticCache:
         self,
         request: ChatCompletionRequest,
         tenant_id: str,
-        bypass_cache: bool = False
-    ) -> Tuple[Optional[ChatCompletionResponse], Optional[str]]:
+        bypass_cache: bool = False,
+        custom_threshold: Optional[float] = None
+    ) -> Tuple[Optional[ChatCompletionResponse], Optional[str], float]:
         """
         Check cache for matching response within tenant partition.
-        Returns: (Response | None, cache_type: 'L1_EXACT' | 'L2_SEMANTIC' | None)
+        Returns: (Response | None, cache_type: 'L1_EXACT' | 'L2_SEMANTIC' | None, similarity_score: float)
         """
         if bypass_cache:
-            return None, None
+            return None, None, 0.0
 
         now = time.monotonic()
+        effective_threshold = (
+            custom_threshold
+            if custom_threshold is not None and 0.5 <= custom_threshold <= 1.0
+            else self.similarity_threshold
+        )
 
         # 1. Check Tier 1 (L1 Exact Match)
         l1_key = self._get_l1_key(request, tenant_id)
@@ -230,9 +236,9 @@ class SemanticCache:
                 hit_resp = resp.model_copy(deep=True)
                 hit_resp.cached = True
                 hit_resp.cache_type = "L1_EXACT"
-                # Track hit in SQLite
+                hit_resp.similarity_score = 1.0
                 sqlite_storage.increment_hits(l1_key)
-                return hit_resp, "L1_EXACT"
+                return hit_resp, "L1_EXACT", 1.0
 
         # 2. Check Tier 2 (L2 Semantic Cosine Similarity within tenant partition)
         partition = self._get_partition(tenant_id)
@@ -259,14 +265,17 @@ class SemanticCache:
                 best_sub_idx = int(np.argmax(scores))
                 best_score = float(scores[best_sub_idx])
 
-                if best_score >= self.similarity_threshold:
+                if best_score >= effective_threshold:
                     matched_idx = candidate_indices[best_sub_idx]
                     hit_resp = partition.entries[matched_idx].model_copy(deep=True)
                     hit_resp.cached = True
                     hit_resp.cache_type = "L2_SEMANTIC"
-                    return hit_resp, "L2_SEMANTIC"
+                    hit_resp.similarity_score = round(best_score, 4)
+                    return hit_resp, "L2_SEMANTIC", best_score
+                else:
+                    return None, None, best_score
 
-        return None, None
+        return None, None, 0.0
 
     async def put(
         self,

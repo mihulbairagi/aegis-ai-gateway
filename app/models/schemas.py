@@ -19,6 +19,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     user: Optional[str] = None
+    similarity_threshold: Optional[float] = None
 
 class ChatChoice(BaseModel):
     index: int = 0
@@ -42,6 +43,7 @@ class ChatCompletionResponse(BaseModel):
     cached: bool = False
     cache_type: Optional[str] = None  # 'L1_EXACT', 'L2_SEMANTIC', or None
     latency_ms: Optional[float] = None
+    similarity_score: Optional[float] = None
     provider: Optional[str] = None
 
 class GatewayMetricsResponse(BaseModel):

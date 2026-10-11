@@ -291,16 +291,94 @@ def test_web_ui_endpoints():
     print("[PASS] test_web_ui_endpoints")
 
 
+def test_semantic_threshold_sweet_spot_0_80():
+    """Verify that natural paraphrases scoring ~0.83 hit L2 cache with default 0.80 threshold (which miss at 0.85)."""
+    reset_state()
+    p1 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "How do I reset my password?"}]
+    }
+    res1 = client.post("/v1/chat/completions", json=p1, headers=ALPHA_HEADERS)
+    assert res1.status_code == 200
+    assert res1.headers.get("x-gateway-cache-status") == "MISS"
+
+    # Query with cosine similarity ~0.8375 (passes default 0.80 threshold, would miss at 0.85)
+    p2 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Steps to reset forgotten password"}]
+    }
+    res2 = client.post("/v1/chat/completions", json=p2, headers=ALPHA_HEADERS)
+    assert res2.status_code == 200
+    assert res2.headers.get("x-gateway-cache-status") == "HIT-L2_SEMANTIC"
+    score = float(res2.headers.get("x-gateway-similarity-score", 0.0))
+    assert 0.80 <= score < 0.85
+    print("[PASS] test_semantic_threshold_sweet_spot_0_80")
+
+
+def test_custom_threshold_override():
+    """Verify X-Similarity-Threshold header and body field dynamically override default threshold."""
+    reset_state()
+    p1 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "How do I reset my password?"}]
+    }
+    client.post("/v1/chat/completions", json=p1, headers=ALPHA_HEADERS)
+
+    # 1. Overly strict custom threshold (0.90) -> Should REJECT score ~0.8375 as MISS
+    strict_headers = {**ALPHA_HEADERS, "X-Similarity-Threshold": "0.90"}
+    p_strict = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Steps to reset forgotten password"}]
+    }
+    res_strict = client.post("/v1/chat/completions", json=p_strict, headers=strict_headers)
+    assert res_strict.status_code == 200
+    assert res_strict.headers.get("x-gateway-cache-status") == "MISS"
+    score_strict = float(res_strict.headers.get("x-gateway-similarity-score", 0.0))
+    assert score_strict < 0.90
+
+    # 2. Reset state to keep test isolated; test relaxed custom threshold (0.75) on query scoring ~0.798 (misses default 0.80)
+    reset_state()
+    client.post("/v1/chat/completions", json=p1, headers=ALPHA_HEADERS)
+
+    relaxed_headers = {**ALPHA_HEADERS, "X-Similarity-Threshold": "0.75"}
+    p_relaxed = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Procedure for resetting forgotten password"}]
+    }
+    res_relaxed = client.post("/v1/chat/completions", json=p_relaxed, headers=relaxed_headers)
+    assert res_relaxed.status_code == 200
+    assert res_relaxed.headers.get("x-gateway-cache-status") == "HIT-L2_SEMANTIC"
+    score_relaxed = float(res_relaxed.headers.get("x-gateway-similarity-score", 0.0))
+    assert 0.75 <= score_relaxed < 0.80
+
+    # 3. Request body threshold override support
+    reset_state()
+    client.post("/v1/chat/completions", json=p1, headers=ALPHA_HEADERS)
+
+    p_body_thresh = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Password reset instructions"}],
+        "similarity_threshold": 0.75
+    }
+    res_body = client.post("/v1/chat/completions", json=p_body_thresh, headers=ALPHA_HEADERS)
+    assert res_body.status_code == 200
+    assert res_body.headers.get("x-gateway-cache-status") == "HIT-L2_SEMANTIC"
+    print("[PASS] test_custom_threshold_override")
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
     test_multi_tenant_cache_isolation()
     test_l2_semantic_cache_hit_true_dense_embeddings()
     test_dissimilar_queries_prevent_false_positives()
+    test_semantic_threshold_sweet_spot_0_80()
+    test_custom_threshold_override()
     test_full_sse_streaming_miss_and_hit()
     test_sqlite_wal_persistence_and_warmup()
     test_cache_bypass_header()
     test_rate_limiter_exceeded()
     test_circuit_breaker_auto_failover()
     test_web_ui_endpoints()
-    print("\nALL 11 PRODUCTION-HARDENED OPEN-SOURCE GATEWAY TESTS PASSED SUCCESSFULLY!")
+    print("\nALL 13 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+

@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Aegis AI Gateway & Semantic Cache",
     description="High-Throughput Enterprise AI Reverse Proxy with L1/L2 Semantic Caching, SQLite WAL Persistence, Token-Bucket Rate Limiting, Multi-Tenant Isolation, and Multi-Provider Routing.",
-    version="1.3.0",
+    version="1.3.1",
     lifespan=lifespan
 )
 
@@ -99,7 +99,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
             headers={"Retry-After": retry_val}
         )
 
-    # 3. Cache-Control & TTL extraction
+    # 3. Cache-Control, Dynamic Threshold, & TTL extraction
     bypass_cache = (
         request.headers.get("X-Bypass-Cache", "").lower() in ("true", "1") or
         request.headers.get("Cache-Control", "").lower() == "no-cache"
@@ -107,11 +107,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     raw_ttl = request.headers.get("X-Cache-TTL")
     custom_ttl = float(raw_ttl) if raw_ttl and raw_ttl.isdigit() else None
 
+    # Dynamic threshold override from request header or body
+    raw_thresh = request.headers.get("X-Similarity-Threshold")
+    custom_thresh = float(raw_thresh) if raw_thresh else req.similarity_threshold
+
     # 4. Check Tiered Multi-Tenant Cache (L1 Exact & L2 Semantic Cosine Match)
-    cached_resp, cache_type = await semantic_cache.get(
+    cached_resp, cache_type, similarity_score = await semantic_cache.get(
         req,
         tenant_id=tenant_id,
-        bypass_cache=bypass_cache
+        bypass_cache=bypass_cache,
+        custom_threshold=custom_thresh
     )
 
     # --- STREAMING RESPONSE HANDLING (req.stream == True) ---
@@ -157,6 +162,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
                 "X-Gateway-Tenant-Id": tenant_id,
                 "X-Gateway-Cache-Status": f"HIT-{cache_type}",
                 "X-Gateway-Latency-Ms": str(round(latency_ms, 2)),
+                "X-Gateway-Similarity-Score": str(round(similarity_score, 4)),
                 "Content-Type": "text/event-stream"
             }
             return StreamingResponse(stream_cached_chunks(), media_type="text/event-stream", headers=stream_headers)
@@ -200,6 +206,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
             "X-Gateway-Tenant-Id": tenant_id,
             "X-Gateway-Cache-Status": "MISS",
             "X-Gateway-Provider": provider_name,
+            "X-Gateway-Similarity-Score": str(round(similarity_score, 4)),
             "Content-Type": "text/event-stream"
         }
         return StreamingResponse(stream_and_cache_wrapper(), media_type="text/event-stream", headers=stream_headers)
@@ -208,6 +215,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     if cached_resp:
         latency_ms = (time.monotonic() - start_time) * 1000.0
         cached_resp.latency_ms = round(latency_ms, 2)
+        cached_resp.similarity_score = round(similarity_score, 4)
         
         # Track metrics
         saved_tokens = cached_resp.usage.total_tokens
@@ -217,6 +225,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
         response.headers["X-Gateway-Tenant-Id"] = tenant_id
         response.headers["X-Gateway-Cache-Status"] = f"HIT-{cache_type}"
         response.headers["X-Gateway-Latency-Ms"] = str(round(latency_ms, 2))
+        response.headers["X-Gateway-Similarity-Score"] = str(round(similarity_score, 4))
         return cached_resp
 
     # Cache Miss -> Forward to Upstream Provider via Circuit Breaker
@@ -226,6 +235,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     upstream_resp.latency_ms = round(latency_ms, 2)
     upstream_resp.provider = provider
     upstream_resp.cached = False
+    upstream_resp.similarity_score = round(similarity_score, 4)
 
     # Store in Cache (partitioned by tenant and persisted to SQLite)
     await semantic_cache.put(
@@ -243,6 +253,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     response.headers["X-Gateway-Cache-Status"] = "MISS"
     response.headers["X-Gateway-Latency-Ms"] = str(round(latency_ms, 2))
     response.headers["X-Gateway-Provider"] = provider
+    response.headers["X-Gateway-Similarity-Score"] = str(round(similarity_score, 4))
     return upstream_resp
 
 
@@ -288,7 +299,7 @@ async def flush_cache(request: Request):
 
 @app.get("/playground", response_class=HTMLResponse)
 async def interactive_playground():
-    """Interactive Chat Playground with real-time semantic caching badges."""
+    """Interactive Chat Playground with real-time semantic caching badges and threshold slider."""
     return """
     <!DOCTYPE html>
     <html lang="en">
@@ -307,7 +318,7 @@ async def interactive_playground():
         <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur px-6 py-3 flex justify-between items-center sticky top-0 z-50">
             <div class="flex items-center space-x-3">
                 <span class="text-xl font-black bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">AEGIS PLAYGROUND</span>
-                <span class="text-xs px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.3.0</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.3.1</span>
             </div>
             <div class="flex items-center space-x-4">
                 <a href="/dashboard" class="text-xs text-slate-400 hover:text-white transition">📊 Live Dashboard</a>
@@ -336,7 +347,16 @@ async def interactive_playground():
 
                 <div>
                     <label class="text-xs text-slate-400 block mb-1">Temperature: <span id="temp-val" class="text-indigo-400 font-mono">0.0</span></label>
-                    <input id="temperature" type="range" min="0" max="1" step="0.1" value="0.0" oninput="document.getElementById('temp-val').innerText = this.value" class="w-full accent-indigo-500">
+                    <input id="temperature" type="range" min="0" max="1" step="0.1" value="0.0" oninput="document.getElementById('temp-val').innerText = this.value" class="w-full accent-indigo-500 cursor-pointer">
+                </div>
+
+                <div class="space-y-1 pt-2 border-t border-slate-800">
+                    <div class="flex justify-between items-center text-xs text-slate-400">
+                        <span>Match Threshold</span>
+                        <span id="threshold-val" class="font-mono text-emerald-400 font-bold">0.80</span>
+                    </div>
+                    <input id="threshold-slider" type="range" min="0.70" max="0.95" step="0.01" value="0.80" oninput="document.getElementById('threshold-val').innerText = this.value" class="w-full accent-emerald-500 cursor-pointer">
+                    <p class="text-[10px] text-slate-500">Sweet spot: 0.78 - 0.82. Lower catches more paraphrases; higher requires strict phrasing.</p>
                 </div>
 
                 <div class="pt-2 border-t border-slate-800 space-y-2">
@@ -352,9 +372,9 @@ async def interactive_playground():
 
                 <div class="pt-3 border-t border-slate-800">
                     <div class="text-[11px] text-slate-400">
-                        <div class="font-semibold text-slate-300 mb-1">💡 Pro Tip for Testing:</div>
-                        1. Type <span class="text-indigo-300 font-mono">"How to cancel my subscription?"</span> (Observe MISS ~1,400ms)<br>
-                        2. Type <span class="text-emerald-300 font-mono">"What is the procedure to cancel subscription?"</span> (Observe L2 HIT ~12ms)!
+                        <div class="font-semibold text-slate-300 mb-1">💡 Real-World Test Pair:</div>
+                        1. <span class="text-indigo-300 font-mono">"How do I cancel my food order on Swiggy"</span><br>
+                        2. <span class="text-emerald-300 font-mono">"swiggy food canceling process ?"</span> (Hits L2 at threshold &le;0.80)!
                     </div>
                 </div>
             </div>
@@ -391,6 +411,7 @@ async def interactive_playground():
                 const apiKey = document.getElementById('api-key').value.trim();
                 const model = document.getElementById('model').value.trim();
                 const temperature = parseFloat(document.getElementById('temperature').value);
+                const threshold = parseFloat(document.getElementById('threshold-slider').value);
                 const bypass = document.getElementById('bypass-cache').checked;
                 const stream = document.getElementById('use-stream').checked;
 
@@ -402,7 +423,8 @@ async def interactive_playground():
 
                 const headers = {
                     'Content-Type': 'application/json',
-                    'Authorization': 'Bearer ' + apiKey
+                    'Authorization': 'Bearer ' + apiKey,
+                    'X-Similarity-Threshold': threshold.toString()
                 };
                 if (bypass) headers['X-Bypass-Cache'] = 'true';
 
@@ -410,7 +432,8 @@ async def interactive_playground():
                     model: model,
                     messages: [{ role: 'user', content: prompt }],
                     temperature: temperature,
-                    stream: stream
+                    stream: stream,
+                    similarity_threshold: threshold
                 };
 
                 const t0 = performance.now();
@@ -424,6 +447,7 @@ async def interactive_playground():
 
                     const latencyMs = Math.round(performance.now() - t0);
                     const cacheStatus = response.headers.get('X-Gateway-Cache-Status') || 'MISS';
+                    const similarityScore = parseFloat(response.headers.get('X-Gateway-Similarity-Score') || '0.0');
 
                     if (!response.ok) {
                         const err = await response.json();
@@ -453,11 +477,11 @@ async def interactive_playground():
                                 }
                             }
                         }
-                        updateBadge(botMsgId, cacheStatus, latencyMs);
+                        updateBadge(botMsgId, cacheStatus, latencyMs, similarityScore, threshold);
                     } else {
                         const data = await response.json();
                         botBox.innerText = data.choices[0].message.content;
-                        updateBadge(botMsgId, cacheStatus, latencyMs);
+                        updateBadge(botMsgId, cacheStatus, latencyMs, similarityScore, threshold);
                     }
                 } catch (err) {
                     botBox.innerHTML = `<span class="text-rose-400">Network Error: ${err.message}</span>`;
@@ -488,7 +512,7 @@ async def interactive_playground():
                 return document.getElementById(id);
             }
 
-            function updateBadge(id, status, latency) {
+            function updateBadge(id, status, latency, score, threshold) {
                 const badge = document.getElementById(`badge-${id}`);
                 if (!badge) return;
                 badge.classList.remove('animate-pulse');
@@ -498,10 +522,14 @@ async def interactive_playground():
                     badge.innerHTML = `⚡ <b>L1 EXACT HIT</b> • ${latency}ms • Cost: $0.00 (Saved!)`;
                 } else if (status.includes('L2_SEMANTIC')) {
                     badge.className = 'text-[11px] font-mono px-2.5 py-0.5 rounded-full inline-flex items-center space-x-1.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 shadow-sm';
-                    badge.innerHTML = `🧠 <b>L2 SEMANTIC MATCH</b> • ${latency}ms • Cost: $0.00 (Saved!)`;
+                    badge.innerHTML = `🧠 <b>L2 SEMANTIC HIT</b> (Cosine: ${score.toFixed(3)} ≥ ${threshold.toFixed(2)}) • ${latency}ms • Cost: $0.00 (Saved!)`;
                 } else {
                     badge.className = 'text-[11px] font-mono px-2.5 py-0.5 rounded-full inline-flex items-center space-x-1.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 shadow-sm';
-                    badge.innerHTML = `🌐 <b>UPSTREAM MISS</b> • ${latency}ms • Cost: $0.003`;
+                    if (score > 0) {
+                        badge.innerHTML = `🌐 <b>UPSTREAM MISS</b> (Best match: ${score.toFixed(3)} &lt; ${threshold.toFixed(2)}) • ${latency}ms • Cost: $0.003`;
+                    } else {
+                        badge.innerHTML = `🌐 <b>UPSTREAM MISS</b> • ${latency}ms • Cost: $0.003`;
+                    }
                 }
             }
 

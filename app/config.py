@@ -42,7 +42,7 @@ class GatewaySettings(BaseModel):
     # Caching Settings
     L1_CACHE_MAX_ITEMS: int = int(os.getenv("L1_CACHE_MAX_ITEMS", "1000"))
     L2_SEMANTIC_CACHE_MAX_ITEMS: int = int(os.getenv("L2_SEMANTIC_CACHE_MAX_ITEMS", "5000"))
-    SEMANTIC_SIMILARITY_THRESHOLD: float = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.85"))
+    SEMANTIC_SIMILARITY_THRESHOLD: float = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.80"))
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     CACHE_DEFAULT_TTL_SECONDS: float = float(os.getenv("CACHE_DEFAULT_TTL_SECONDS", "300.0"))
 
