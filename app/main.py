@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -17,10 +18,20 @@ from app.core.circuit_breaker import circuit_breaker, CircuitState
 from app.core.proxy import proxy_client
 from app.core.metrics import metrics_tracker
 
+logger = logging.getLogger("aegis.gateway")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan task for periodic rate limiter bucket cleanup."""
+    """Lifespan task for periodic rate limiter bucket cleanup and dense engine health verification."""
+    if not semantic_cache.is_dense_active:
+        logger.error(
+            "CRITICAL: FastEmbed is not active! Gateway is operating on low-accuracy FastNumpy fallback. "
+            "To enable true ONNX dense embeddings (0.76-0.88 paraphrase matching), run: pip install fastembed"
+        )
+    else:
+        logger.info("FastEmbed dense semantic cache is active (all-MiniLM-L6-v2 ONNX CPU).")
+
     async def periodic_bucket_cleaner():
         while True:
             try:
@@ -168,6 +179,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
                 "X-Gateway-Cache-Status": f"HIT-{cache_type}",
                 "X-Gateway-Latency-Ms": str(round(latency_ms, 2)),
                 "X-Gateway-Similarity-Score": str(round(similarity_score, 4)),
+                "X-Gateway-Dense-Active": str(semantic_cache.is_dense_active).lower(),
                 "Content-Type": "text/event-stream"
             }
             return StreamingResponse(stream_cached_chunks(), media_type="text/event-stream", headers=stream_headers)
@@ -212,6 +224,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
             "X-Gateway-Cache-Status": "MISS",
             "X-Gateway-Provider": provider_name,
             "X-Gateway-Similarity-Score": str(round(similarity_score, 4)),
+            "X-Gateway-Dense-Active": str(semantic_cache.is_dense_active).lower(),
             "Content-Type": "text/event-stream"
         }
         return StreamingResponse(stream_and_cache_wrapper(), media_type="text/event-stream", headers=stream_headers)
@@ -231,6 +244,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
         response.headers["X-Gateway-Cache-Status"] = f"HIT-{cache_type}"
         response.headers["X-Gateway-Latency-Ms"] = str(round(latency_ms, 2))
         response.headers["X-Gateway-Similarity-Score"] = str(round(similarity_score, 4))
+        response.headers["X-Gateway-Dense-Active"] = str(semantic_cache.is_dense_active).lower()
         return cached_resp
 
     # Cache Miss -> Forward to Upstream Provider via Circuit Breaker
@@ -259,6 +273,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     response.headers["X-Gateway-Latency-Ms"] = str(round(latency_ms, 2))
     response.headers["X-Gateway-Provider"] = provider
     response.headers["X-Gateway-Similarity-Score"] = str(round(similarity_score, 4))
+    response.headers["X-Gateway-Dense-Active"] = str(semantic_cache.is_dense_active).lower()
     return upstream_resp
 
 
@@ -269,6 +284,8 @@ async def get_metrics():
     provider_info = get_active_provider_info()
     summary["circuit_breaker_state"] = state.value
     summary["active_provider"] = f"{provider_info['name']} ({route})"
+    summary["is_dense_active"] = semantic_cache.is_dense_active
+    summary["embedding_engine"] = "fastembed (all-MiniLM-L6-v2)" if semantic_cache.is_dense_active else "fastnumpy_fallback"
     return summary
 
 
@@ -305,7 +322,43 @@ async def flush_cache(request: Request):
 @app.get("/playground", response_class=HTMLResponse)
 async def interactive_playground():
     """Interactive Chat Playground with real-time semantic caching badges and threshold slider."""
-    return """
+    is_dense = semantic_cache.is_dense_active
+    
+    if is_dense:
+        engine_badge = """<span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 flex items-center space-x-1.5 shadow-sm">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span>ONNX Dense Embeddings Active</span>
+        </span>"""
+        fallback_banner = ""
+        engine_sidebar = """<div class="pt-2 border-t border-slate-800">
+            <div class="flex justify-between items-center text-[11px] text-slate-400 mb-1">
+                <span>Embedding Model:</span>
+                <span class="font-mono text-[11px] font-semibold text-emerald-400">all-MiniLM-L6-v2 (ONNX)</span>
+            </div>
+        </div>"""
+    else:
+        engine_badge = """<span class="text-xs px-2.5 py-0.5 rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/30 flex items-center space-x-1.5 shadow-sm" title="FastEmbed is not installed! Run 'pip install fastembed'">
+            <span class="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+            <span>⚠️ FastNumpy Fallback (fastembed missing)</span>
+        </span>"""
+        fallback_banner = """<div class="mb-4 bg-rose-500/10 border border-rose-500/30 rounded-xl p-3 text-rose-300 text-xs shadow-lg">
+            <div class="flex items-center space-x-2.5">
+                <span class="text-xl">⚠️</span>
+                <div>
+                    <b>Dense ONNX Model Not Loaded:</b> Running on fallback MD5 word hashing. Semantic paraphrases will yield low similarity scores (0.30 - 0.49) and miss cache!
+                    <div class="mt-1 text-[11px] text-slate-300">To enable true dense embeddings in your active environment, run: <code class="bg-slate-900 border border-slate-700 px-2 py-0.5 rounded text-rose-300 font-mono font-bold">pip install fastembed</code> then restart the server.</div>
+                </div>
+            </div>
+        </div>"""
+        engine_sidebar = """<div class="pt-2 border-t border-slate-800">
+            <div class="flex justify-between items-center text-[11px] text-slate-400 mb-1">
+                <span>Embedding Engine:</span>
+                <span class="font-mono text-[11px] font-semibold text-rose-400">FastNumpy Fallback</span>
+            </div>
+            <p class="text-[10px] text-rose-400/80">fastembed missing; run 'pip install fastembed'</p>
+        </div>"""
+
+    raw_html = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -324,6 +377,7 @@ async def interactive_playground():
             <div class="flex items-center space-x-3">
                 <span class="text-xl font-black bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">AEGIS PLAYGROUND</span>
                 <span class="text-xs px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.3.1</span>
+                __ENGINE_BADGE__
             </div>
             <div class="flex items-center space-x-4">
                 <a href="/dashboard" class="text-xs text-slate-400 hover:text-white transition">📊 Live Dashboard</a>
@@ -369,6 +423,8 @@ async def interactive_playground():
                     <p class="text-[10px] text-slate-500">Sweet spot: 0.78 - 0.82. Lower catches more paraphrases; higher requires strict phrasing.</p>
                 </div>
 
+                __ENGINE_SIDEBAR__
+
                 <div class="pt-2 border-t border-slate-800 space-y-2">
                     <label class="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer">
                         <input id="bypass-cache" type="checkbox" class="accent-indigo-500">
@@ -393,6 +449,7 @@ async def interactive_playground():
             <div class="md:col-span-3 bg-slate-900 border border-slate-800 rounded-xl flex flex-col h-[75vh]">
                 <!-- Chat Message Feed -->
                 <div id="chat-feed" class="flex-1 overflow-y-auto p-5 space-y-4">
+                    __FALLBACK_BANNER__
                     <div class="text-center text-xs text-slate-400 py-4">
                         🚀 Welcome to Aegis Playground. Start chatting to test instant L1 exact hits & ONNX dense L2 semantic matches.
                     </div>
@@ -566,6 +623,7 @@ async def interactive_playground():
     </body>
     </html>
     """
+    return raw_html.replace("__ENGINE_BADGE__", engine_badge).replace("__FALLBACK_BANNER__", fallback_banner).replace("__ENGINE_SIDEBAR__", engine_sidebar)
 
 
 # --- Web UI: Operational Metrics Dashboard ---

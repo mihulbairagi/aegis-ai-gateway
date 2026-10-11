@@ -54,6 +54,8 @@ class GatewayMetricsResponse(BaseModel):
     cache_hit_ratio_percent: float
     circuit_breaker_state: str
     active_provider: str
+    is_dense_active: bool = False
+    embedding_engine: str = "fastembed"
     p50_latency_ms: float
     p90_latency_ms: float = 0.0
     p95_latency_ms: float

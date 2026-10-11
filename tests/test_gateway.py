@@ -328,6 +328,31 @@ def test_web_ui_endpoints():
     print("[PASS] test_web_ui_endpoints")
 
 
+def test_dense_telemetry_and_health_flags():
+    """Verify is_dense_active telemetry flag and response headers."""
+    reset_state()
+    # 1. SemanticCache property is boolean
+    assert isinstance(semantic_cache.is_dense_active, bool)
+
+    # 2. Metrics endpoint exposes is_dense_active and embedding_engine
+    metrics_res = client.get("/metrics")
+    assert metrics_res.status_code == 200
+    data = metrics_res.json()
+    assert "is_dense_active" in data
+    assert "embedding_engine" in data
+    assert isinstance(data["is_dense_active"], bool)
+
+    # 3. Chat completions response includes X-Gateway-Dense-Active header
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Telemetry header check"}]
+    }
+    chat_res = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+    assert chat_res.status_code == 200
+    assert "x-gateway-dense-active" in chat_res.headers
+    print("[PASS] test_dense_telemetry_and_health_flags")
+
+
 def test_semantic_threshold_sweet_spot_0_80():
     """Verify that natural paraphrases scoring ~0.83 hit L2 cache with default 0.80 threshold (which miss at 0.85)."""
     reset_state()
@@ -444,10 +469,12 @@ def test_dev_keys_and_admin_default_disabled_without_env():
         "assert not verify_admin_key('change-me');"
         "print('ok')"
     )
+    import tempfile
     env = {k: v for k, v in os.environ.items()
            if k not in ("AEGIS_DEV_MODE", "ADMIN_API_KEY", "TENANT_API_KEYS")}
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+    env["PYTHONPATH"] = root
+    out = subprocess.run([sys.executable, "-c", code], cwd=tempfile.gettempdir(), env=env,
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert "ok" in out.stdout
@@ -518,11 +545,12 @@ if __name__ == "__main__":
     test_circuit_breaker_auto_failover()
     test_circuit_breaker_half_open_probe_limit()
     test_web_ui_endpoints()
+    test_dense_telemetry_and_health_flags()
     test_playground_does_not_leak_admin_key()
     test_old_default_admin_key_rejected()
     test_dev_keys_and_admin_default_disabled_without_env()
     test_expired_entries_not_served_after_restart()
     test_purge_expired_removes_sqlite_rows()
     test_client_ttl_is_capped()
-    print("\nALL 20 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    print("\nALL 21 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 

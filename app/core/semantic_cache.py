@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import re
+import sys
 import time
 from collections import OrderedDict
 from typing import Optional, Tuple, List, Dict
@@ -61,12 +62,35 @@ class FastEmbedDenseEmbedder:
         self._model = None
         self._init_model()
 
+    @property
+    def is_dense_active(self) -> bool:
+        """Returns True if the true transformer ONNX model is loaded and active."""
+        return self._model is not None
+
     def _init_model(self):
         try:
             from fastembed import TextEmbedding
+            logger.info(f"Loading dense FastEmbed ONNX model '{self.model_name}'...")
             self._model = TextEmbedding(model_name=self.model_name)
-        except Exception:
+            logger.info(f"FastEmbed dense model '{self.model_name}' loaded successfully (ONNX CPU).")
+        except ImportError as e:
             self._model = None
+            msg = (
+                "CRITICAL: 'fastembed' package is not installed in the active Python environment! "
+                "Running on low-accuracy FastNumpy MD5 fallback (paraphrases will yield low 0.30-0.49 cosine scores). "
+                "Run 'pip install fastembed' to enable true dense semantic caching."
+            )
+            logger.error(msg)
+            print(f"\n[AEGIS WARNING] {msg}\n", file=sys.stderr)
+        except Exception as e:
+            self._model = None
+            msg = (
+                f"CRITICAL: FastEmbed failed to load ({e})! "
+                "Running on low-accuracy FastNumpy MD5 fallback. "
+                "Run 'pip install fastembed' or verify ONNX runtime to enable true dense semantic caching."
+            )
+            logger.error(msg)
+            print(f"\n[AEGIS WARNING] {msg}\n", file=sys.stderr)
 
     def _normalize_text(self, text: str) -> str:
         """
@@ -86,8 +110,8 @@ class FastEmbedDenseEmbedder:
                 vec = np.array(embeddings[0], dtype=np.float32)
                 norm = np.linalg.norm(vec)
                 return vec / norm if norm > 0 else vec
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"FastEmbed inference error ({e}), using FastNumpy fallback for this query.")
         return self._fallback.embed(text)
 
 
@@ -168,6 +192,11 @@ class SemanticCache:
 
         # Warm up existing entries from SQLite disk persistence
         self.warmup()
+
+    @property
+    def is_dense_active(self) -> bool:
+        """Returns True if the ONNX transformer model is active (not fallback)."""
+        return self.embedder.is_dense_active
 
     def warmup(self):
         """Warm up in-memory indices from persistent SQLite storage on process start."""
