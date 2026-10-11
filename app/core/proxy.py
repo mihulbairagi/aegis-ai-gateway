@@ -1,6 +1,7 @@
 import time
 import httpx
 from typing import Tuple, Dict, Any, Optional
+from fastapi import HTTPException
 from app.config import settings
 from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo
 from app.core.circuit_breaker import circuit_breaker
@@ -9,6 +10,7 @@ class UpstreamProxy:
     """
     High-concurrency async reverse proxy client with connection pooling,
     automatic circuit-breaker failover, and zero-token simulated mock fallback.
+    Distinguishes client 4xx errors (no circuit trip) from 5xx/timeouts (circuit trip).
     """
     def __init__(self):
         # High-throughput connection pool: 100 keep-alive, 500 max connections
@@ -17,17 +19,18 @@ class UpstreamProxy:
             timeout=httpx.Timeout(settings.CIRCUIT_TIMEOUT_SECONDS)
         )
 
+    def _is_live_key(self, key: str) -> bool:
+        if not key:
+            return False
+        return key not in ("mock-primary-key", "mock-fallback-key", "your-primary-api-key-here", "")
+
     async def forward(self, request: ChatCompletionRequest) -> Tuple[ChatCompletionResponse, str]:
         """
         Routes request to healthy upstream provider.
         Returns: (ChatCompletionResponse, provider_name: str)
         """
         route, state = circuit_breaker.get_route()
-        provider_name = f"{route}_provider"
-        start_time = time.monotonic()
-
-        # Check if live provider keys are configured, otherwise use high-speed simulated upstream
-        is_live_primary = settings.PRIMARY_API_KEY != "mock-primary-key"
+        is_live_primary = self._is_live_key(settings.PRIMARY_API_KEY)
 
         if is_live_primary and route == "primary":
             try:
@@ -41,9 +44,21 @@ class UpstreamProxy:
                     payload=payload
                 )
                 circuit_breaker.record_success()
-                return response, "primary_routerplus"
-            except Exception as e:
-                # Primary failed (timeout / 5xx / connection error), record failure and trip breaker
+                return response, "primary_live"
+            except httpx.HTTPStatusError as e:
+                # 4xx client errors MUST NOT trip the circuit breaker
+                if 400 <= e.response.status_code < 500:
+                    raise HTTPException(
+                        status_code=e.response.status_code,
+                        detail=f"Upstream provider client error ({e.response.status_code}): {e.response.text[:200]}"
+                    )
+                # 5xx server error from upstream: record failure and try fallback
+                circuit_breaker.record_failure()
+                return await self._call_fallback(request)
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError):
+                circuit_breaker.record_failure()
+                return await self._call_fallback(request)
+            except Exception:
                 circuit_breaker.record_failure()
                 return await self._call_fallback(request)
 
@@ -52,7 +67,7 @@ class UpstreamProxy:
 
     async def _call_fallback(self, request: ChatCompletionRequest) -> Tuple[ChatCompletionResponse, str]:
         """Calls secondary fallback provider."""
-        is_live_fallback = settings.FALLBACK_API_KEY != "mock-fallback-key"
+        is_live_fallback = self._is_live_key(settings.FALLBACK_API_KEY)
         if is_live_fallback:
             try:
                 payload = request.model_dump(exclude_unset=True)
@@ -64,7 +79,13 @@ class UpstreamProxy:
                     api_key=settings.FALLBACK_API_KEY,
                     payload=payload
                 )
-                return response, "fallback_gemini"
+                return response, "fallback_live"
+            except httpx.HTTPStatusError as e:
+                if 400 <= e.response.status_code < 500:
+                    raise HTTPException(
+                        status_code=e.response.status_code,
+                        detail=f"Fallback provider client error ({e.response.status_code}): {e.response.text[:200]}"
+                    )
             except Exception:
                 pass
         return await self._call_simulated_upstream(request, "fallback_failover")
@@ -81,10 +102,9 @@ class UpstreamProxy:
 
     async def _call_simulated_upstream(self, request: ChatCompletionRequest, route: str) -> Tuple[ChatCompletionResponse, str]:
         """
-        Simulated upstream response (simulating real 100ms - 200ms LLM completion latency)
-        Enables stress-testing at 1,000 RPS without paying OpenAI API bills!
+        Simulated upstream response (simulating real LLM completion)
+        Enables stress-testing at scale without external API dependency.
         """
-        # Extract prompt to give realistic contextual answer
         last_msg = request.messages[-1].content if request.messages else "Hello"
         answer = f"Processed response for: '{last_msg[:60]}...' via {route} engine."
 

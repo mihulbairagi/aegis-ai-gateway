@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import re
 import time
@@ -8,85 +9,11 @@ import numpy as np
 from app.config import settings
 from app.models.schemas import ChatCompletionResponse, ChatCompletionRequest
 
-# Common English conversational stopwords to filter out from semantic vectors
-STOPWORDS = {
-    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-    'have', 'has', 'had', 'do', 'does', 'did', 'to', 'from', 'in', 'out',
-    'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once',
-    'here', 'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both',
-    'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor',
-    'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'can',
-    'will', 'just', 'don', 'should', 'now', 'what', 'which', 'who', 'whom',
-    'this', 'that', 'these', 'those', 'am', 'i', 'me', 'my', 'myself',
-    'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 'yourself',
-    'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers',
-    'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs'
-}
-
-# Domain semantic canonicalization map for high-frequency queries
-SEMANTIC_SYNONYMS = {
-    # Subscription / Cancellation
-    'procedure': 'cancel',
-    'steps': 'cancel',
-    'cancel': 'cancel',
-    'cancelling': 'cancel',
-    'cancellation': 'cancel',
-    'terminate': 'cancel',
-    'unsubscribe': 'cancel',
-    'subscription': 'subscription',
-    'plan': 'subscription',
-    'membership': 'subscription',
-
-    # Refund / Billing
-    'refund': 'refund',
-    'refunds': 'refund',
-    'refunding': 'refund',
-    'reimburse': 'refund',
-    'reimbursement': 'refund',
-    'policy': 'refund',
-    'request': 'refund',
-    'order': 'refund',
-
-    # Auth / Password
-    'password': 'password',
-    'passwords': 'password',
-    'credential': 'password',
-    'credentials': 'password',
-    'reset': 'reset',
-    'resetting': 'reset',
-    'change': 'reset',
-    'changing': 'reset',
-    'forgot': 'reset',
-
-    # Shipping / Logistics
-    'shipment': 'shipping',
-    'shipping': 'shipping',
-    'package': 'shipping',
-    'parcel': 'shipping',
-    'delivery': 'shipping',
-    'deliver': 'shipping',
-    'track': 'shipping',
-    'tracking': 'shipping',
-    'status': 'shipping',
-
-    # Corporate / Entity
-    'company': 'company',
-    'enterprise': 'company',
-    'firm': 'company',
-    'organization': 'company',
-    'business': 'company',
-    'history': 'history',
-    'founded': 'history',
-    'origin': 'history',
-    'inception': 'history',
-    'background': 'history'
-}
-
 class FastNumpyEmbedder:
     """
-    Lightweight, sub-millisecond semantic vector embedder using token canonicalization,
-    stopword filtering, and character/word n-gram hashing projection normalized to unit length.
-    Zero PyTorch/GPU dependency, ultra-fast for 8GB RAM machines (takes <0.1ms).
+    Lightweight, fallback CPU semantic vector embedder using tokenization
+    and character/word n-gram hashing projection normalized to unit length.
+    Zero PyTorch/GPU dependency.
     """
     def __init__(self, dim: int = 384):
         self.dim = dim
@@ -98,14 +25,9 @@ class FastNumpyEmbedder:
         for word in raw_tokens:
             if word in ('user', 'system', 'assistant', 'tool'):
                 continue
-            if word in STOPWORDS:
-                continue
 
-            # Semantic canonicalization
-            canon = SEMANTIC_SYNONYMS.get(word, word)
-
-            # Word / canonical token hash projection (primary semantic signal)
-            h_word = int(hashlib.md5(canon.encode()).hexdigest(), 16) % self.dim
+            # Word hash projection
+            h_word = int(hashlib.md5(word.encode()).hexdigest(), 16) % self.dim
             vector[h_word] += 2.0
 
             # Character trigrams for morphological and typo tolerance
@@ -122,10 +44,10 @@ class FastNumpyEmbedder:
 
 class FastEmbedDenseEmbedder:
     """
-    Real dense semantic vector embedder using fastembed (ONNX Runtime on CPU).
+    Production dense semantic vector embedder using fastembed (ONNX Runtime on CPU).
     Uses 'sentence-transformers/all-MiniLM-L6-v2' (384-dimensional unit vector)
     with sub-10ms CPU inference, <60MB memory footprint, and zero PyTorch/GPU overhead.
-    Seamlessly falls back to FastNumpyEmbedder if model is offline or loading fails.
+    No hardcoded regex hacks — true contextual embeddings.
     """
     def __init__(self, model_name: str = settings.EMBEDDING_MODEL):
         self.model_name = model_name
@@ -141,41 +63,18 @@ class FastEmbedDenseEmbedder:
         except Exception:
             self._model = None
 
-    def _normalize_intent(self, text: str) -> str:
+    def _normalize_text(self, text: str) -> str:
         """
-        Normalizes conversational intent expressions so queries with distinct wording
-        but identical intent (e.g. 'cancel my subscription' vs 'I want a refund and stop billing')
-        reliably yield >=0.85 cosine similarity.
+        Clean conversational role prefixes and redundant whitespace while
+        preserving complete natural language semantic syntax for the transformer model.
         """
         t = text.lower().strip()
         t = re.sub(r'^(user|system|assistant|tool):\s*', '', t)
-        t = re.sub(r'[?!.,;]', '', t)
-        
-        # Subscription, Order & Cancellation intent
-        if re.search(r'\b(stop\s+(my\s+)?billing|refund\s+and\s+stop\s+billing|cancel\s+(my\s+)?(order|subscription|plan|membership))\b', t):
-            t = re.sub(r'i\s+want\s+(a\s+)?refund\s+and\s+stop\s+(my\s+)?billing', 'cancel subscription', t)
-            t = re.sub(r'stop\s+(my\s+)?billing', 'cancel subscription', t)
-            t = re.sub(r'cancel\s+(my\s+)?(order|subscription|plan|membership)', 'cancel subscription', t)
-        t = re.sub(r'\b(what\s+is\s+the\s+procedure\s+to\s+cancel|how\s+do\s+i\s+cancel|procedure\s+to\s+cancel|how\s+to\s+cancel)\b', 'cancel subscription', t)
-        
-        # Refund intent
-        t = re.sub(r'\b(how\s+can\s+i\s+request\s+a\s+refund\s+for\s+my\s+order|request\s+a\s+refund\s+for\s+my\s+order|how\s+to\s+request\s+a\s+refund)\b', 'what is your refund policy', t)
-        t = re.sub(r'\b(what\s+is\s+the\s+refund\s+policy)\b', 'what is your refund policy', t)
-        
-        # Credential / Password intent
-        t = re.sub(r'\b(i\s+forgot\s+my\s+password\s+how\s+to\s+change\s+it|how\s+to\s+change\s+password|forgot\s+password)\b', 'how to reset password', t)
-        t = re.sub(r'\b(reset\s+my\s+credentials|change\s+my\s+credentials)\b', 'how to reset password', t)
-        
-        # Shipping / Delivery tracking
-        t = re.sub(r'\b(can\s+you\s+track\s+my\s+package\s+delivery\s+status|track\s+my\s+package\s+delivery\s+status|track\s+package)\b', 'where is my shipment', t)
-        
-        # Enterprise history
-        t = re.sub(r'\b(when\s+was\s+this\s+enterprise\s+founded|when\s+was\s+company\s+founded|enterprise\s+founded)\b', 'tell me about company history', t)
-        
-        return t
+        t = re.sub(r'\s+', ' ', t)
+        return t.strip()
 
     def embed(self, text: str) -> np.ndarray:
-        normalized = self._normalize_intent(text)
+        normalized = self._normalize_text(text)
         if self._model is not None:
             try:
                 embeddings = list(self._model.embed([normalized]))
@@ -186,95 +85,190 @@ class FastEmbedDenseEmbedder:
                 pass
         return self._fallback.embed(text)
 
+
+class TenantL2Partition:
+    """Isolated L2 Semantic Cache partition for a specific tenant."""
+    def __init__(self, max_items: int = settings.L2_SEMANTIC_CACHE_MAX_ITEMS):
+        self.max_items = max_items
+        self.vectors: List[np.ndarray] = []
+        self.entries: List[ChatCompletionResponse] = []
+        self.prompts: List[str] = []
+        self.models: List[str] = []
+        self.temperatures: List[float] = []
+        self.timestamps: List[float] = []
+        self.ttls: List[float] = []
+
+    def evict_oldest(self):
+        if self.vectors:
+            self.vectors.pop(0)
+            self.entries.pop(0)
+            self.prompts.pop(0)
+            self.models.pop(0)
+            self.temperatures.pop(0)
+            self.timestamps.pop(0)
+            self.ttls.pop(0)
+
+    def clear(self):
+        self.vectors.clear()
+        self.entries.clear()
+        self.prompts.clear()
+        self.models.clear()
+        self.temperatures.clear()
+        self.timestamps.clear()
+        self.ttls.clear()
+
+
 class SemanticCache:
     """
-    Two-Tier Caching Architecture:
-    - Tier 1 (L1): O(1) Exact-match LRU cache via MD5 hash (<0.2ms)
-    - Tier 2 (L2): Dense ONNX Semantic Vector Search with FastNumpy fallback (<10ms)
+    Production-Hardened Multi-Tenant Semantic Cache:
+    - Tier 1 (L1): O(1) Exact-match LRU partitioned by (tenant_id, model, temperature) (<0.1ms)
+    - Tier 2 (L2): Dense ONNX Semantic Vector Search partitioned strictly per tenant (<15ms)
+    - Non-blocking async embedding execution via asyncio.to_thread
+    - Per-entry TTL invalidation and Client-controlled bypass (X-Bypass-Cache)
     """
     def __init__(
         self,
         l1_max_items: int = settings.L1_CACHE_MAX_ITEMS,
         l2_max_items: int = settings.L2_SEMANTIC_CACHE_MAX_ITEMS,
-        similarity_threshold: float = settings.SEMANTIC_SIMILARITY_THRESHOLD
+        similarity_threshold: float = settings.SEMANTIC_SIMILARITY_THRESHOLD,
+        default_ttl: float = settings.CACHE_DEFAULT_TTL_SECONDS
     ):
         self.l1_max_items = l1_max_items
         self.l2_max_items = l2_max_items
         self.similarity_threshold = similarity_threshold
+        self.default_ttl = default_ttl
         
-        # L1: hash -> ChatCompletionResponse
-        self.l1_cache: OrderedDict[str, ChatCompletionResponse] = OrderedDict()
+        # L1: exact_key -> (ChatCompletionResponse, created_at, ttl_seconds)
+        self.l1_cache: OrderedDict[str, Tuple[ChatCompletionResponse, float, float]] = OrderedDict()
         
-        # L2: list of (vector, prompt_text, ChatCompletionResponse)
-        self.l2_vectors: List[np.ndarray] = []
-        self.l2_entries: List[ChatCompletionResponse] = []
-        self.l2_prompts: List[str] = []
+        # L2: tenant_id -> TenantL2Partition
+        self.l2_partitions: Dict[str, TenantL2Partition] = {}
         
         self.embedder = FastEmbedDenseEmbedder(model_name=settings.EMBEDDING_MODEL)
 
+    def _get_partition(self, tenant_id: str) -> TenantL2Partition:
+        if tenant_id not in self.l2_partitions:
+            self.l2_partitions[tenant_id] = TenantL2Partition(max_items=self.l2_max_items)
+        return self.l2_partitions[tenant_id]
+
     def _extract_prompt_text(self, request: ChatCompletionRequest) -> str:
-        """Extracts the concatenated user/system prompt text for hashing and embedding."""
+        """Extracts concatenated prompt messages for hashing and embedding."""
         return "\n".join([f"{m.role}:{m.content}" for m in request.messages])
 
-    def _get_exact_hash(self, request: ChatCompletionRequest) -> str:
-        raw = f"{request.model}|{request.temperature}|{self._extract_prompt_text(request)}"
-        return hashlib.md5(raw.encode()).hexdigest()
+    def _get_l1_key(self, request: ChatCompletionRequest, tenant_id: str) -> str:
+        """Partitioned L1 cache key strictly bound to tenant_id, model, and temperature."""
+        prompt_text = self._extract_prompt_text(request)
+        prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()
+        temp = request.temperature if request.temperature is not None else 0.0
+        return f"{tenant_id}:{request.model}:{temp}:{prompt_hash}"
 
-    def get(self, request: ChatCompletionRequest) -> Tuple[Optional[ChatCompletionResponse], Optional[str]]:
+    async def get(
+        self,
+        request: ChatCompletionRequest,
+        tenant_id: str,
+        bypass_cache: bool = False
+    ) -> Tuple[Optional[ChatCompletionResponse], Optional[str]]:
         """
-        Check cache for matching response.
+        Check cache for matching response within tenant partition.
         Returns: (Response | None, cache_type: 'L1_EXACT' | 'L2_SEMANTIC' | None)
         """
-        prompt_text = self._extract_prompt_text(request)
+        if bypass_cache:
+            return None, None
+
+        now = time.monotonic()
 
         # 1. Check Tier 1 (L1 Exact Match)
-        exact_key = self._get_exact_hash(request)
-        if exact_key in self.l1_cache:
-            # Move to end for LRU
-            self.l1_cache.move_to_end(exact_key)
-            resp = self.l1_cache[exact_key].model_copy(deep=True)
-            resp.cached = True
-            resp.cache_type = "L1_EXACT"
-            return resp, "L1_EXACT"
+        l1_key = self._get_l1_key(request, tenant_id)
+        if l1_key in self.l1_cache:
+            resp, created_at, ttl = self.l1_cache[l1_key]
+            # Check TTL expiration
+            if now - created_at > ttl:
+                del self.l1_cache[l1_key]
+            else:
+                self.l1_cache.move_to_end(l1_key)
+                hit_resp = resp.model_copy(deep=True)
+                hit_resp.cached = True
+                hit_resp.cache_type = "L1_EXACT"
+                return hit_resp, "L1_EXACT"
 
-        # 2. Check Tier 2 (L2 Semantic Cosine Similarity)
-        if len(self.l2_vectors) > 0:
-            query_vec = self.embedder.embed(prompt_text)
-            # Stack into matrix for vectorized cosine similarity calculation
-            matrix = np.vstack(self.l2_vectors) # shape: (N, 384)
-            # Since vectors are unit normalized, cosine_similarity = dot_product
-            scores = np.dot(matrix, query_vec) # shape: (N,)
-            best_idx = int(np.argmax(scores))
-            best_score = float(scores[best_idx])
+        # 2. Check Tier 2 (L2 Semantic Cosine Similarity within tenant partition)
+        partition = self._get_partition(tenant_id)
+        if len(partition.vectors) > 0:
+            req_temp = request.temperature if request.temperature is not None else 0.0
+            
+            # Find candidate indices matching model, temperature, and valid TTL
+            candidate_indices = [
+                i for i in range(len(partition.vectors))
+                if partition.models[i] == request.model
+                and abs(partition.temperatures[i] - req_temp) < 1e-4
+                and (now - partition.timestamps[i] <= partition.ttls[i])
+            ]
 
-            if best_score >= self.similarity_threshold:
-                resp = self.l2_entries[best_idx].model_copy(deep=True)
-                resp.cached = True
-                resp.cache_type = "L2_SEMANTIC"
-                return resp, "L2_SEMANTIC"
+            if candidate_indices:
+                prompt_text = self._extract_prompt_text(request)
+                # Run CPU embedding inference asynchronously in worker thread (non-blocking)
+                query_vec = await asyncio.to_thread(self.embedder.embed, prompt_text)
+
+                candidate_vectors = [partition.vectors[i] for i in candidate_indices]
+                matrix = np.vstack(candidate_vectors)  # shape: (K, 384)
+                
+                # Vectors are unit normalized, cosine similarity = dot product
+                scores = np.dot(matrix, query_vec)
+                best_sub_idx = int(np.argmax(scores))
+                best_score = float(scores[best_sub_idx])
+
+                if best_score >= self.similarity_threshold:
+                    matched_idx = candidate_indices[best_sub_idx]
+                    hit_resp = partition.entries[matched_idx].model_copy(deep=True)
+                    hit_resp.cached = True
+                    hit_resp.cache_type = "L2_SEMANTIC"
+                    return hit_resp, "L2_SEMANTIC"
 
         return None, None
 
-    def put(self, request: ChatCompletionRequest, response: ChatCompletionResponse):
-        """Stores response in both L1 (exact) and L2 (semantic) caches."""
+    async def put(
+        self,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+        tenant_id: str,
+        bypass_cache: bool = False,
+        ttl_seconds: Optional[float] = None
+    ):
+        """Stores response in L1 and L2 caches partitioned by tenant."""
+        if bypass_cache:
+            return
+
+        now = time.monotonic()
+        ttl = ttl_seconds if ttl_seconds is not None and ttl_seconds > 0 else self.default_ttl
         prompt_text = self._extract_prompt_text(request)
-        exact_key = self._get_exact_hash(request)
+        req_temp = request.temperature if request.temperature is not None else 0.0
 
         # Store in L1
+        l1_key = self._get_l1_key(request, tenant_id)
         if len(self.l1_cache) >= self.l1_max_items:
-            self.l1_cache.popitem(last=False) # Evict oldest
-        self.l1_cache[exact_key] = response
+            self.l1_cache.popitem(last=False)
+        self.l1_cache[l1_key] = (response, now, ttl)
 
-        # Store in L2
-        vec = self.embedder.embed(prompt_text)
-        if len(self.l2_vectors) >= self.l2_max_items:
-            # Evict oldest entry
-            self.l2_vectors.pop(0)
-            self.l2_entries.pop(0)
-            self.l2_prompts.pop(0)
+        # Store in L2 (isolated tenant partition)
+        partition = self._get_partition(tenant_id)
+        vec = await asyncio.to_thread(self.embedder.embed, prompt_text)
+        
+        if len(partition.vectors) >= partition.max_items:
+            partition.evict_oldest()
 
-        self.l2_vectors.append(vec)
-        self.l2_entries.append(response)
-        self.l2_prompts.append(prompt_text)
+        partition.vectors.append(vec)
+        partition.entries.append(response)
+        partition.prompts.append(prompt_text)
+        partition.models.append(request.model)
+        partition.temperatures.append(req_temp)
+        partition.timestamps.append(now)
+        partition.ttls.append(ttl)
+
+    def clear(self):
+        """Flushes all tenant L1 and L2 caches."""
+        self.l1_cache.clear()
+        for partition in self.l2_partitions.values():
+            partition.clear()
+        self.l2_partitions.clear()
 
 semantic_cache = SemanticCache()

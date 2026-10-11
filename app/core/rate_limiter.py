@@ -5,20 +5,26 @@ from app.config import settings
 class TokenBucketRateLimiter:
     """
     High-performance in-memory Token Bucket rate limiter with sliding replenishment.
-    Thread-safe and designed for sub-millisecond overhead under high RPS.
+    Keyed per tenant_id with automatic stale client eviction to prevent memory leaks.
     """
     def __init__(self, rate_rps: int = settings.DEFAULT_RATE_LIMIT_RPS, burst_capacity: int = settings.DEFAULT_BURST_CAPACITY):
         self.rate_rps = rate_rps
         self.capacity = burst_capacity
         # Storage format: client_id -> (current_tokens: float, last_updated_timestamp: float)
         self.buckets: Dict[str, Tuple[float, float]] = {}
+        self.last_cleanup_time = time.monotonic()
 
     def is_allowed(self, client_id: str) -> Tuple[bool, float]:
         """
-        Check if request is allowed.
+        Check if request is allowed for this client_id / tenant_id.
         Returns: (allowed: bool, retry_after_seconds: float)
         """
         now = time.monotonic()
+
+        # Opportunistic lazy cleanup every 60 seconds to purge inactive clients
+        if now - self.last_cleanup_time > 60.0:
+            self.cleanup_stale_buckets(ttl_seconds=1800.0)
+            self.last_cleanup_time = now
 
         if client_id not in self.buckets:
             # First request from this client
@@ -43,8 +49,8 @@ class TokenBucketRateLimiter:
             self.buckets[client_id] = (new_tokens, now)
             return False, max(0.01, retry_after)
 
-    def cleanup_stale_buckets(self, ttl_seconds: float = 300.0):
-        """Periodically clean up inactive clients to prevent memory leaks."""
+    def cleanup_stale_buckets(self, ttl_seconds: float = 1800.0):
+        """Clean up inactive tenant/client buckets to prevent memory leaks."""
         now = time.monotonic()
         stale_keys = [
             k for k, (_, last_time) in self.buckets.items()
