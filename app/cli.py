@@ -1,5 +1,11 @@
 import sys
 import os
+
+# Ensure project root is always in sys.path regardless of where 'aegis' is invoked
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 import argparse
 import asyncio
 import uvicorn
@@ -20,7 +26,7 @@ def start_server(host: str, port: int, reload: bool):
         f"• Metrics:    [bold yellow]http://{host}:{port}/metrics[/bold yellow]",
         border_style="cyan"
     ))
-    uvicorn.run("app.main:app", host=host, port=port, reload=reload)
+    uvicorn.run("app.main:app", host=host, port=port, reload=reload, app_dir=ROOT_DIR)
 
 def flush_cache(url: str, admin_key: str):
     """Flushes all L1/L2 caches and SQLite records."""
