@@ -15,6 +15,79 @@ from app.core.storage import sqlite_storage
 
 logger = logging.getLogger(__name__)
 
+# Zero-overhead lexical & typo normalization map for common keyboard slips,
+# chat abbreviations, and high-frequency user typos in LLM queries.
+LEXICAL_NORMALIZATION_MAP: Dict[str, str] = {
+    # Forgot typos
+    "fogot": "forgot", "forgt": "forgot", "forgott": "forgot", "frogot": "forgot", "fogott": "forgot",
+    # Password typos & shortcuts
+    "passward": "password", "passwrd": "password", "pasword": "password",
+    "passwrod": "password", "paword": "password", "passord": "password",
+    "psswd": "password", "pswd": "password",
+    # Reset typos
+    "resset": "reset", "rset": "reset", "resett": "reset",
+    # Change typos
+    "chnage": "change", "chagne": "change", "chng": "change", "chnge": "change",
+    # Cancel typos
+    "cancle": "cancel", "cancell": "cancel", "cancled": "canceled", "cancl": "cancel",
+    "cancelling": "canceling",
+    # Account typos
+    "accout": "account", "acount": "account", "acnt": "account", "acc": "account", "acct": "account",
+    # Delete typos
+    "dlete": "delete", "delte": "delete", "delt": "delete",
+    # Update typos
+    "updt": "update", "updte": "update",
+    # Refund typos
+    "refnd": "refund", "refun": "refund", "refud": "refund",
+    # Order typos
+    "ordr": "order", "oder": "order",
+    # Payment typos
+    "pymnt": "payment", "paymnt": "payment", "pyment": "payment",
+    # Subscription typos
+    "subcription": "subscription", "subscrip": "subscription", "subscripton": "subscription",
+    # Address typos
+    "addres": "address", "adress": "address", "adrs": "address",
+    # Delivery typos
+    "delivry": "delivery", "delvery": "delivery", "dlvry": "delivery",
+    # Status typos
+    "sttus": "status", "statuss": "status", "stats": "status",
+    # Common service brands
+    "swigy": "swiggy", "swigi": "swiggy",
+    "zomto": "zomato", "zomatto": "zomato",
+    # Chat slang & quick abbreviations
+    "hw": "how", "wat": "what", "wht": "what",
+    "plz": "please", "pls": "please",
+    "u": "you", "ur": "your", "r": "are",
+    "bcz": "because", "cuz": "because", "coz": "because",
+    "hlp": "help", "thx": "thanks", "thanx": "thanks", "tnx": "thanks",
+}
+
+
+def normalize_text_for_embedding(text: str) -> str:
+    """
+    Clean conversational role prefixes, collapse repeated characters (e.g. 'pleaaase' -> 'please'),
+    and normalize common keyboard slip typos / chat slang to preserve high-confidence dense
+    semantic cosine similarity on human input before vector embedding.
+    """
+    t = text.lower().strip()
+    t = re.sub(r'^(user|system|assistant|tool):\s*', '', t)
+    # Deduplicate 3+ repeated characters (e.g. 'pleaaase' -> 'please', 'soooo' -> 'so')
+    t = re.sub(r'(\w)\1{2,}', r'\1', t)
+    words = t.split()
+    normalized_words = []
+    for w in words:
+        m = re.match(r"^([^\w]*)([\w'-]+)([^\w]*)$", w)
+        if m:
+            prefix, core, suffix = m.groups()
+            core_replacement = LEXICAL_NORMALIZATION_MAP.get(core, core)
+            normalized_words.append(f"{prefix}{core_replacement}{suffix}")
+        else:
+            normalized_words.append(LEXICAL_NORMALIZATION_MAP.get(w, w))
+    t = " ".join(normalized_words)
+    t = re.sub(r'\s+', ' ', t)
+    return t.strip()
+
+
 class FastNumpyEmbedder:
     """
     Lightweight, fallback CPU semantic vector embedder using tokenization
@@ -25,7 +98,8 @@ class FastNumpyEmbedder:
         self.dim = dim
 
     def embed(self, text: str) -> np.ndarray:
-        raw_tokens = re.findall(r'[a-z0-9]+', text.lower())
+        normalized = normalize_text_for_embedding(text)
+        raw_tokens = re.findall(r'[a-z0-9]+', normalized)
         vector = np.zeros(self.dim, dtype=np.float32)
 
         for word in raw_tokens:
@@ -53,7 +127,7 @@ class FastEmbedDenseEmbedder:
     Production dense semantic vector embedder using fastembed (ONNX Runtime on CPU).
     Uses 'sentence-transformers/all-MiniLM-L6-v2' (384-dimensional unit vector)
     with sub-10ms CPU inference, <60MB memory footprint, and zero PyTorch/GPU overhead.
-    No hardcoded regex hacks — true contextual embeddings.
+    No hardcoded regex hacks — true contextual embeddings with zero-latency lexical normalization.
     """
     def __init__(self, model_name: str = settings.EMBEDDING_MODEL):
         self.model_name = model_name
@@ -94,13 +168,9 @@ class FastEmbedDenseEmbedder:
 
     def _normalize_text(self, text: str) -> str:
         """
-        Clean conversational role prefixes and redundant whitespace while
-        preserving complete natural language semantic syntax for the transformer model.
+        Clean conversational role prefixes, repeated characters, and common keyboard typos.
         """
-        t = text.lower().strip()
-        t = re.sub(r'^(user|system|assistant|tool):\s*', '', t)
-        t = re.sub(r'\s+', ' ', t)
-        return t.strip()
+        return normalize_text_for_embedding(text)
 
     def embed(self, text: str) -> np.ndarray:
         normalized = self._normalize_text(text)
@@ -112,7 +182,7 @@ class FastEmbedDenseEmbedder:
                 return vec / norm if norm > 0 else vec
             except Exception as e:
                 logger.warning(f"FastEmbed inference error ({e}), using FastNumpy fallback for this query.")
-        return self._fallback.embed(text)
+        return self._fallback.embed(normalized)
 
 
 class TenantL2Partition:

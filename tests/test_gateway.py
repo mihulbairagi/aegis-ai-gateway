@@ -530,6 +530,31 @@ def test_client_ttl_is_capped():
     assert recs and all(r["ttl"] <= settings.CACHE_MAX_TTL_SECONDS for r in recs)
 
 
+def test_lexical_typo_normalization_cache_hit():
+    """Verify that human keyboard slips and typos (fogot, passward, resset, etc.)
+    are normalized pre-embedding so intent matches reliably score >= 0.85 and hit L2 cache."""
+    reset_state()
+    p1 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "how do i reset my password"}]
+    }
+    res1 = client.post("/v1/chat/completions", json=p1, headers=ALPHA_HEADERS)
+    assert res1.status_code == 200
+    assert res1.headers.get("x-gateway-cache-status") == "MISS"
+
+    # Query with multiple typos: 'fogot', 'passward', 'resset'
+    p2 = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "i fogot my passward how to resset"}]
+    }
+    res2 = client.post("/v1/chat/completions", json=p2, headers=ALPHA_HEADERS)
+    assert res2.status_code == 200
+    assert res2.headers.get("x-gateway-cache-status") == "HIT-L2_SEMANTIC"
+    score = float(res2.headers.get("x-gateway-similarity-score", 0.0))
+    assert score >= 0.85, f"Expected score >= 0.85 with typo normalization, got {score}"
+    print("[PASS] test_lexical_typo_normalization_cache_hit")
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -552,5 +577,7 @@ if __name__ == "__main__":
     test_expired_entries_not_served_after_restart()
     test_purge_expired_removes_sqlite_rows()
     test_client_ttl_is_capped()
-    print("\nALL 21 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_lexical_typo_normalization_cache_hit()
+    print("\nALL 22 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+
 
