@@ -202,29 +202,33 @@ def test_sqlite_wal_persistence_and_warmup():
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "Persistent DB check query"}]
     }
-    res = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
-    assert res.status_code == 200
+    with TestClient(app) as c:
+        res = c.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+        assert res.status_code == 200
 
-    time.sleep(0.05)
+        # Poll until the background task persists the row to SQLite (eliminates test-only race condition)
+        deadline = time.time() + 5.0
+        found = False
+        while time.time() < deadline:
+            records = sqlite_storage.load_all_records()
+            if any("Persistent DB check" in r["prompt"] for r in records):
+                found = True
+                break
+            time.sleep(0.05)
+        assert found, "Expected record was not found in SQLite storage!"
 
-    # Verify SQLite file has the record
-    records = sqlite_storage.load_all_records()
-    assert len(records) >= 1
-    found = any("Persistent DB check" in r["prompt"] for r in records)
-    assert found, "Expected record was not found in SQLite storage!"
+        # Simulate process restart by clearing in-memory structures only
+        semantic_cache.l1_cache.clear()
+        for p in semantic_cache.l2_partitions.values():
+            p.clear()
 
-    # Simulate process restart by clearing in-memory structures only
-    semantic_cache.l1_cache.clear()
-    for p in semantic_cache.l2_partitions.values():
-        p.clear()
+        # Trigger warmup (simulating server reboot)
+        semantic_cache.warmup()
 
-    # Trigger warmup (simulating server reboot)
-    semantic_cache.warmup()
-
-    # Verify query now hits L1 cache instantly without calling upstream!
-    res_after_reboot = client.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
-    assert res_after_reboot.status_code == 200
-    assert res_after_reboot.headers.get("x-gateway-cache-status") == "HIT-L1_EXACT"
+        # Verify query now hits L1 cache instantly without calling upstream!
+        res_after_reboot = c.post("/v1/chat/completions", json=payload, headers=ALPHA_HEADERS)
+        assert res_after_reboot.status_code == 200
+        assert res_after_reboot.headers.get("x-gateway-cache-status") == "HIT-L1_EXACT"
     print("[PASS] test_sqlite_wal_persistence_and_warmup")
 
 

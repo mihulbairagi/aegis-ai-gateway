@@ -641,12 +641,12 @@ async def interactive_playground():
                 });
 
                 const adminKeyInput = document.getElementById('admin-key');
-                const savedAdminKey = localStorage.getItem('aegis_admin_api_key');
+                const savedAdminKey = sessionStorage.getItem('aegis_admin_api_key');
                 if (savedAdminKey) {
                     adminKeyInput.value = savedAdminKey;
                 }
                 adminKeyInput.addEventListener('input', () => {
-                    localStorage.setItem('aegis_admin_api_key', adminKeyInput.value.trim());
+                    sessionStorage.setItem('aegis_admin_api_key', adminKeyInput.value.trim());
                 });
             });
         </script>
