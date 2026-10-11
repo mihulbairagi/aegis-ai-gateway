@@ -438,9 +438,11 @@ async def interactive_playground():
 
                 <div class="pt-3 border-t border-slate-800">
                     <div class="text-[11px] text-slate-400">
-                        <div class="font-semibold text-slate-300 mb-1">💡 Real-World Test Pair:</div>
+                        <div class="font-semibold text-slate-300 mb-1">💡 Real-World Test Pairs:</div>
                         1. <span class="text-indigo-300 font-mono">"How do I cancel my food order on Swiggy"</span><br>
-                        2. <span class="text-emerald-300 font-mono">"swiggy food canceling process ?"</span> (Hits L2 at threshold &le;0.80)!
+                        2. <span class="text-emerald-300 font-mono">"I want to cancel my Swiggy food order"</span> (Cosine: ~0.969 🔥)<br>
+                        3. <span class="text-emerald-300 font-mono">"Steps to cancel order on Swiggy"</span> (Cosine: ~0.884 🧠)<br>
+                        <p class="text-[10px] text-slate-500 mt-1 italic">Note: Telegram keyword "swiggy food canceling process" scores ~0.745 (set slider &le;0.74).</p>
                     </div>
                 </div>
             </div>
