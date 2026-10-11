@@ -659,6 +659,14 @@ def test_guard_blocks_alnum_numbers_negation_and_extended_antonyms():
         ("upgrade my plan", "downgrade my plan"),
         ("login to my account", "logout of my account"),
         ("how do I enables 2FA", "how do I disables 2FA"),
+        ("what is the free tier", "what is the paid tier"),
+        ("make repository public", "make repository private"),
+        ("what is the monthly price", "what is the yearly price"),
+        ("what is the monthly price", "what is the annual price"),
+        ("schedule meeting today", "schedule meeting tomorrow"),
+        ("events before noon", "events after noon"),
+        ("process the first item", "process the last item"),
+        ("inbound traffic filter", "outbound traffic filter"),
     ]
     for a, b in must_reject:
         assert not g(a, b), f"guard leaked: {a!r} vs {b!r}"
@@ -671,6 +679,76 @@ def test_guard_blocks_alnum_numbers_negation_and_extended_antonyms():
     ]
     for a, b in must_pass:
         assert g(a, b), f"guard over-rejected: {a!r} vs {b!r}"
+
+
+def test_system_prompt_dilution_prevention():
+    semantic_cache.clear()
+
+    long_system_prompt = (
+        "You are an enterprise AI customer support representative for Aegis Financial Services. "
+        "Adhere strictly to corporate compliance protocol 4.2. Always maintain a polite, courteous, "
+        "and professional tone. Verify customer identity before disclosing sensitive financial information. "
+        "Ensure all transaction guidelines are rigorously enforced according to ISO-27001 security standards."
+    )
+
+    # 1. Seed query: Request A with long system prompt
+    req_a = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": long_system_prompt},
+            {"role": "user", "content": "How do I refund my order?"}
+        ],
+        "temperature": 0.0
+    }
+    res_a = client.post("/v1/chat/completions", json=req_a, headers=ALPHA_HEADERS)
+    assert res_a.status_code == 200
+    assert res_a.json()["cached"] is False
+
+    # 2. Query B: Different user intent under the SAME long system prompt
+    # Without dilution prevention, 90%+ overlapping system tokens would cause false L2 hit (0.984+ score)
+    req_b = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": long_system_prompt},
+            {"role": "user", "content": "How do I cancel my subscription?"}
+        ],
+        "temperature": 0.0
+    }
+    res_b = client.post("/v1/chat/completions", json=req_b, headers=ALPHA_HEADERS)
+    assert res_b.status_code == 200
+    assert res_b.json()["cached"] is False, "System prompt dilution caused false positive cache hit on different user intent!"
+
+    # 3. Query C: Legitimate paraphrase under the SAME long system prompt
+    req_c = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": long_system_prompt},
+            {"role": "user", "content": "Steps to refund my order"}
+        ],
+        "temperature": 0.0
+    }
+    res_c = client.post("/v1/chat/completions", json=req_c, headers=ALPHA_HEADERS)
+    assert res_c.status_code == 200
+    if semantic_cache.is_dense_active:
+        assert res_c.json()["cached"] is True
+        assert res_c.json()["cache_type"] == "L2_SEMANTIC"
+
+    # 4. Query D: Same user intent but DIFFERENT system persona
+    # Personas must not cross-pollinate cached responses
+    pirate_system_prompt = "You are a pirate AI assistant. Always speak in sea shanties and pirate slang, Ahoy!"
+    req_d = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": pirate_system_prompt},
+            {"role": "user", "content": "Steps to refund my order"}
+        ],
+        "temperature": 0.0
+    }
+    res_d = client.post("/v1/chat/completions", json=req_d, headers=ALPHA_HEADERS)
+    assert res_d.status_code == 200
+    assert res_d.json()["cached"] is False, "Different system prompt personas falsely shared L2 cache!"
+    print("[PASS] test_system_prompt_dilution_prevention")
+
 
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
@@ -700,6 +778,7 @@ if __name__ == "__main__":
     test_half_open_probe_released_without_verdict_and_self_heals()
     test_entity_and_polarity_guard_prevents_false_positives()
     test_guard_blocks_alnum_numbers_negation_and_extended_antonyms()
-    print("\nALL 27 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_system_prompt_dilution_prevention()
+    print("\nALL 28 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 

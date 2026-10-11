@@ -119,6 +119,13 @@ POLARITY_PAIRS = [
     ({"approve", "accept"}, {"reject", "decline"}),
     ({"cancel"}, {"renew"}),
     ({"on"}, {"off"}),
+    ({"free"}, {"paid"}),
+    ({"public"}, {"private"}),
+    ({"monthly"}, {"yearly", "annual"}),
+    ({"today"}, {"tomorrow", "yesterday"}),
+    ({"before"}, {"after"}),
+    ({"first"}, {"last", "final"}),
+    ({"inbound"}, {"outbound"}),
 ]
 
 _POLARITY_LOOKUP: Dict[str, Tuple[int, str]] = {}
@@ -141,6 +148,10 @@ _NUMBER_WORDS = {
 }
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:[.,][0-9]+)*")
 _PHRASAL_ON_OFF = re.compile(r"\b(?:turn|turning|switch|switching|toggle)\w*\s+(?:\w+\s+){0,2}?(on|off)\b")
+_ON_OFF_PAIR_IDX = next(
+    (idx for idx, (p, n) in enumerate(POLARITY_PAIRS) if "on" in p and "off" in n),
+    -1
+)
 
 
 def _polarity_of(token: str):
@@ -171,7 +182,8 @@ def _extract_guard_features(text: str):
         if pol:
             polarities.add(pol)
     for m in _PHRASAL_ON_OFF.finditer(t):
-        polarities.add((len(POLARITY_PAIRS) - 1, "pos" if m.group(1) == "on" else "neg"))
+        if _ON_OFF_PAIR_IDX >= 0:
+            polarities.add((_ON_OFF_PAIR_IDX, "pos" if m.group(1) == "on" else "neg"))
     return numbers, has_neg, polarities
 
 
@@ -294,6 +306,8 @@ class TenantL2Partition:
         self.vectors: List[np.ndarray] = []
         self.entries: List[ChatCompletionResponse] = []
         self.prompts: List[str] = []
+        self.semantic_prompts: List[str] = []
+        self.sys_hashes: List[str] = []
         self.models: List[str] = []
         self.temperatures: List[float] = []
         self.timestamps: List[float] = []
@@ -304,6 +318,10 @@ class TenantL2Partition:
             self.vectors.pop(0)
             self.entries.pop(0)
             self.prompts.pop(0)
+            if self.semantic_prompts:
+                self.semantic_prompts.pop(0)
+            if self.sys_hashes:
+                self.sys_hashes.pop(0)
             self.models.pop(0)
             self.temperatures.pop(0)
             self.timestamps.pop(0)
@@ -313,6 +331,8 @@ class TenantL2Partition:
         self.vectors.clear()
         self.entries.clear()
         self.prompts.clear()
+        self.semantic_prompts.clear()
+        self.sys_hashes.clear()
         self.models.clear()
         self.temperatures.clear()
         self.timestamps.clear()
@@ -326,6 +346,8 @@ class TenantL2Partition:
             self.vectors = [self.vectors[i] for i in keep]
             self.entries = [self.entries[i] for i in keep]
             self.prompts = [self.prompts[i] for i in keep]
+            self.semantic_prompts = [self.semantic_prompts[i] for i in keep]
+            self.sys_hashes = [self.sys_hashes[i] for i in keep]
             self.models = [self.models[i] for i in keep]
             self.temperatures = [self.temperatures[i] for i in keep]
             self.timestamps = [self.timestamps[i] for i in keep]
@@ -396,10 +418,13 @@ class SemanticCache:
                 self.l1_cache[l1_key] = (resp, created_at, ttl)
 
                 if vector is not None and len(vector) == self.embedder.dim:
+                    sys_hash, semantic_text = self._split_raw_prompt_text(prompt)
                     partition = self._get_partition(tenant_id)
                     partition.vectors.append(vector)
                     partition.entries.append(resp)
                     partition.prompts.append(prompt)
+                    partition.semantic_prompts.append(semantic_text)
+                    partition.sys_hashes.append(sys_hash)
                     partition.models.append(model)
                     partition.temperatures.append(temp)
                     partition.timestamps.append(created_at)
@@ -415,6 +440,56 @@ class SemanticCache:
     def _extract_prompt_text(self, request: ChatCompletionRequest) -> str:
         """Extracts concatenated prompt messages for hashing and embedding."""
         return "\n".join([f"{m.role}:{m.content}" for m in request.messages])
+
+    def _split_request_prompt(self, request: ChatCompletionRequest) -> Tuple[str, str, str]:
+        """
+        Splits request messages into:
+        (full_prompt, sys_hash, semantic_text)
+
+        - full_prompt: complete conversation used for L1 key and persistence
+        - sys_hash: 16-char SHA256 of system instructions or 'none' (for strict persona isolation)
+        - semantic_text: user/assistant conversation intent without system prompt dilution
+        """
+        full_prompt = "\n".join([f"{m.role}:{m.content}" for m in request.messages])
+        sys_parts = [m.content for m in request.messages if m.role in ("system", "developer")]
+        if sys_parts:
+            sys_hash = hashlib.sha256("\n".join(sys_parts).encode()).hexdigest()[:16]
+        else:
+            sys_hash = "none"
+
+        semantic_parts = [f"{m.role}:{m.content}" for m in request.messages if m.role not in ("system", "developer")]
+        if semantic_parts:
+            semantic_text = "\n".join(semantic_parts).strip()
+        else:
+            semantic_text = full_prompt
+
+        return full_prompt, sys_hash, semantic_text
+
+    def _split_raw_prompt_text(self, prompt_text: str) -> Tuple[str, str]:
+        """
+        Splits a serialized prompt string into (sys_hash, semantic_text).
+        Used during SQLite warmup.
+        """
+        lines = prompt_text.split("\n")
+        sys_lines = []
+        semantic_lines = []
+        for line in lines:
+            if line.startswith("system:") or line.startswith("developer:"):
+                parts = line.split(":", 1)
+                sys_lines.append(parts[1] if len(parts) > 1 else line)
+            else:
+                semantic_lines.append(line)
+
+        if sys_lines:
+            sys_hash = hashlib.sha256("\n".join(sys_lines).encode()).hexdigest()[:16]
+        else:
+            sys_hash = "none"
+
+        semantic_text = "\n".join(semantic_lines).strip()
+        if not semantic_text:
+            semantic_text = prompt_text
+
+        return sys_hash, semantic_text
 
     def _get_l1_key(self, request: ChatCompletionRequest, tenant_id: str) -> str:
         """Partitioned L1 cache key strictly bound to tenant_id, model, and temperature."""
@@ -444,8 +519,12 @@ class SemanticCache:
             else self.similarity_threshold
         )
 
-        # 1. Check Tier 1 (L1 Exact Match)
-        l1_key = self._get_l1_key(request, tenant_id)
+        full_prompt, sys_hash, semantic_text = self._split_request_prompt(request)
+        req_temp = request.temperature if request.temperature is not None else 0.0
+
+        # 1. Check Tier 1 (L1 Exact Match on full prompt)
+        prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()
+        l1_key = f"{tenant_id}:{request.model}:{req_temp}:{prompt_hash}"
         if l1_key in self.l1_cache:
             resp, created_at, ttl = self.l1_cache[l1_key]
             # Check TTL expiration
@@ -463,19 +542,17 @@ class SemanticCache:
         # 2. Check Tier 2 (L2 Semantic Cosine Similarity within tenant partition)
         partition = self._get_partition(tenant_id)
         if len(partition.vectors) > 0:
-            req_temp = request.temperature if request.temperature is not None else 0.0
-            
-            # Find candidate indices matching model, temperature, and valid TTL
+            # Find candidate indices matching model, temperature, system persona hash, and valid TTL
             candidate_indices = [
                 i for i in range(len(partition.vectors))
                 if partition.models[i] == request.model
                 and abs(partition.temperatures[i] - req_temp) < 1e-4
+                and (partition.sys_hashes[i] == sys_hash if partition.sys_hashes else True)
                 and (now - partition.timestamps[i] <= partition.ttls[i])
             ]
 
             if candidate_indices:
-                prompt_text = self._extract_prompt_text(request)
-                query_vec = await asyncio.to_thread(self.embedder.embed, prompt_text)
+                query_vec = await asyncio.to_thread(self.embedder.embed, semantic_text)
 
                 candidate_vectors = [partition.vectors[i] for i in candidate_indices]
                 matrix = np.vstack(candidate_vectors)  # shape: (K, 384)
@@ -490,10 +567,14 @@ class SemanticCache:
                     if score < effective_threshold:
                         break
                     matched_idx = candidate_indices[sub_idx]
-                    candidate_prompt = partition.prompts[matched_idx]
+                    candidate_semantic = (
+                        partition.semantic_prompts[matched_idx]
+                        if partition.semantic_prompts
+                        else partition.prompts[matched_idx]
+                    )
 
-                    # Verify high-precision entity & polarity guard (antonyms, number integrity)
-                    if entity_and_polarity_guard(candidate_prompt, prompt_text):
+                    # Verify high-precision entity & polarity guard on user conversation intent
+                    if entity_and_polarity_guard(candidate_semantic, semantic_text):
                         hit_resp = partition.entries[matched_idx].model_copy(deep=True)
                         hit_resp.cached = True
                         hit_resp.cache_type = "L2_SEMANTIC"
@@ -502,7 +583,7 @@ class SemanticCache:
                     else:
                         logger.debug(
                             f"L2 candidate rejected by Entity/Polarity Guard (score: {score:.4f}): "
-                            f"'{candidate_prompt}' vs '{prompt_text}'"
+                            f"'{candidate_semantic}' vs '{semantic_text}'"
                         )
 
                 return None, None, best_overall_score
@@ -524,25 +605,29 @@ class SemanticCache:
         now = time.time()
         ttl = ttl_seconds if ttl_seconds is not None and ttl_seconds > 0 else self.default_ttl
         ttl = min(ttl, settings.CACHE_MAX_TTL_SECONDS)
-        prompt_text = self._extract_prompt_text(request)
+        
+        full_prompt, sys_hash, semantic_text = self._split_request_prompt(request)
         req_temp = request.temperature if request.temperature is not None else 0.0
 
         # Store in L1
-        l1_key = self._get_l1_key(request, tenant_id)
+        prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()
+        l1_key = f"{tenant_id}:{request.model}:{req_temp}:{prompt_hash}"
         if len(self.l1_cache) >= self.l1_max_items:
             self.l1_cache.popitem(last=False)
         self.l1_cache[l1_key] = (response, now, ttl)
 
-        # Store in L2 (isolated tenant partition)
+        # Store in L2 (isolated tenant partition, embedding pure semantic intent)
         partition = self._get_partition(tenant_id)
-        vec = await asyncio.to_thread(self.embedder.embed, prompt_text)
+        vec = await asyncio.to_thread(self.embedder.embed, semantic_text)
         
         if len(partition.vectors) >= partition.max_items:
             partition.evict_oldest()
 
         partition.vectors.append(vec)
         partition.entries.append(response)
-        partition.prompts.append(prompt_text)
+        partition.prompts.append(full_prompt)
+        partition.semantic_prompts.append(semantic_text)
+        partition.sys_hashes.append(sys_hash)
         partition.models.append(request.model)
         partition.temperatures.append(req_temp)
         partition.timestamps.append(now)
@@ -556,7 +641,7 @@ class SemanticCache:
             tenant_id,
             request.model,
             req_temp,
-            prompt_text,
+            full_prompt,
             resp_json,
             vec,
             now,

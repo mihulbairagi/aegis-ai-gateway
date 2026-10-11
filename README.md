@@ -197,11 +197,12 @@ for chunk in stream:
 
 ## Verification & Automated Test Suite
 
-Aegis includes 27 automated production unit and integration tests verifying all core subsystems:
+Aegis includes 28 automated production unit and integration tests verifying all core subsystems:
 - Multi-tenant partition isolation & dev-mode security gates
 - FastEmbed ONNX dense semantic caching & sweet-spot threshold
+- System prompt dilution prevention & persona hash partition isolation
 - Pre-embedding lexical & typo normalization (human slips)
-- Post-embedding entity number, negation, and antonym polarity guards
+- Post-embedding entity number, negation, and 31 antonym polarity guards
 - Circuit breaker auto-failover, half-open probe limiting, and self-heal
 - SQLite WAL persistence, warmup, and TTL caps
 
@@ -211,18 +212,25 @@ pytest tests/ -v
 
 Output:
 ```text
-======================== 27 passed, 1 warning in 6.32s ========================
+======================== 28 passed, 1 warning in 6.60s ========================
 ```
 
 ---
 
-### Semantic Cache Precision & Entity Considerations
-Aegis couples high-dimensional dense embeddings (`all-MiniLM-L6-v2`) with a multi-factor **Post-Embedding Guard** covering:
-1. **Alphanumeric & Number-Word Integrity**: `500rs` vs `5000rs`, `10gb` vs `100gb`, `python3` vs `python2`, `five hundred` vs `five thousand`.
-2. **Explicit Negation Checking**: Rejects matches across `not`, `can't`, `never`, `without`.
-3. **24 Antonym Polarity Classes with Inflection**: Rejects opposing actions (`enable/disable`, `buy/sell`, `login/logout`, `turn on/turn off`).
+### Semantic Cache Precision, Context Isolation & Known Limits
 
-For queries involving sensitive role or domain entities (e.g. `admin` vs `user`), clients can enforce stricter matching via the dynamic `X-Similarity-Threshold: 0.88` header or bypass caching with `X-Bypass-Cache: true`.
+1. **System Prompt Dilution Prevention & Persona Isolation**:
+   - In production, multi-message prompts often contain long system instructions (100–500 tokens). Concatenating system instructions into the embedding string causes 90%+ token overlap across distinct user queries, triggering false positives (cosine similarity > 0.98).
+   - **Resolution**: Aegis isolates system instructions into a deterministic 16-character `sys_hash`. L2 vector search requires candidate `sys_hash == query.sys_hash` (preventing cross-persona leakage) while computing dense embeddings and guard evaluations strictly over the conversational user intent (`semantic_text`).
+
+2. **Multi-Factor Post-Embedding Guard**:
+   - **Alphanumeric & Number-Word Integrity**: Strict equality on digit tokens (`500rs` vs `5000rs`, `10gb` vs `100gb`, `python3` vs `python2`, `five hundred` vs `five thousand`).
+   - **Explicit Negation Checking**: Rejects matches across `not`, `can't`, `never`, `without`.
+   - **31 Antonym Polarity Classes with Inflection**: Rejects opposing actions (`enable/disable`, `buy/sell`, `login/logout`, `turn on/off`, `free/paid`, `public/private`, `monthly/yearly`, `today/tomorrow`, `before/after`, `first/last`, `inbound/outbound`).
+
+3. **Known Boundaries & Defense-in-Depth**:
+   - Dense embeddings naturally compress syntactic nuances. Rule-based guards handle known high-risk antonyms and numerical invariants, but arbitrary entity swaps (e.g., *Netflix* vs *Hotstar*) rely on semantic distance.
+   - For mission-critical endpoints requiring strict entity guarantees, Aegis supports tenant-configurable threshold overrides via `X-Similarity-Threshold: 0.88` or complete bypass via `X-Bypass-Cache: true`.
 
 ---
 
