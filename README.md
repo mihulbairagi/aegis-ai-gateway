@@ -197,7 +197,7 @@ for chunk in stream:
 
 ## Verification & Automated Test Suite
 
-Aegis includes 36 automated production unit and integration tests verifying all core subsystems:
+Aegis includes 37 automated production unit and integration tests verifying all core subsystems:
 - Multi-tenant partition isolation & dev-mode security gates
 - FastEmbed ONNX dense semantic caching & sweet-spot threshold
 - System prompt dilution prevention & persona hash partition isolation
@@ -205,6 +205,7 @@ Aegis includes 36 automated production unit and integration tests verifying all 
 - Per-user cache isolation (`user_scope`) across restarts
 - Sampling parameter isolation (`params_hash`) and truncation exclusion (`finish_reason == "length"`)
 - Tool-calling passthrough, agent loop message acceptance, and cache bypass (`X-Gateway-Cache-Status: BYPASS`)
+- Multimodal request cache bypass (`X-Gateway-Bypass-Reason: multimodal`) preventing image collision
 - Pre-embedding lexical & typo normalization (human slips)
 - Post-embedding entity number, negation, and 31 antonym polarity guards
 - Circuit breaker auto-failover, half-open probe limiting, and self-heal
@@ -216,7 +217,7 @@ pytest tests/ -v
 
 Output:
 ```text
-======================== 36 passed, 1 warning in 7.23s ========================
+======================== 37 passed, 1 warning in 7.30s ========================
 ```
 
 ---
@@ -237,8 +238,9 @@ Output:
    - Sampling parameters (`max_tokens`, `top_p`, `n`, `stop`, `seed`, `response_format`, penalties) are canonically hashed into `params_hash` and partitioned in both L1 exact and L2 semantic caches. Varying generation configurations never collide.
    - Truncated completions (`finish_reason == "length"`) are strictly excluded from cache storage to avoid serving truncated responses to subsequent requests.
 
-3. **Tool Calling & Agent Loop Cache Bypass**:
-   - Requests containing `tools`, `functions`, `tool_choice`, or agent loop message roles (`tool`, `function`, assistant tool calls) or `n > 1` automatically bypass the cache (`X-Gateway-Cache-Status: BYPASS`, with reason specified in `X-Gateway-Bypass-Reason`).
+3. **Tool Calling & Multimodal Cache Bypass**:
+   - Requests containing `tools`, `functions`, `tool_choice`, agent loop message roles (`tool`, `function`, assistant tool calls), or `n > 1` automatically bypass the cache (`X-Gateway-Cache-Status: BYPASS`, with reason specified in `X-Gateway-Bypass-Reason`).
+   - Multimodal requests with non-text parts (`image_url`, `input_audio`, `file`) automatically bypass cache (`X-Gateway-Bypass-Reason: multimodal`), preventing separate images with identical text questions from colliding. Text-only list-content requests remain fully cacheable.
    - Responses containing `tool_calls` pass through to the client unchanged and are never stored in cache.
    - OpenAI schema fields and multimodal content blocks (`[{"type": "text", "text": "..."}]`) are handled without crashing.
 

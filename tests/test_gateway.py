@@ -1062,6 +1062,68 @@ def test_list_content_and_none_content_do_not_crash():
         assert res2.status_code == 200
 
 
+def test_multimodal_requests_bypass_cache_and_text_only_cached():
+    """Verify multimodal requests bypass cache (reason multimodal) and text-only list requests are cacheable."""
+    reset_state()
+    cat_req = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this picture"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+                ]
+            }
+        ]
+    }
+    dog_req = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this picture"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/dog.png"}}
+                ]
+            }
+        ]
+    }
+
+    with TestClient(app) as c:
+        # 1. Cat request -> BYPASS with reason multimodal
+        res_cat = c.post("/v1/chat/completions", json=cat_req, headers=ALPHA_HEADERS)
+        assert res_cat.status_code == 200
+        assert res_cat.headers.get("x-gateway-cache-status") == "BYPASS"
+        assert res_cat.headers.get("x-gateway-bypass-reason") == "multimodal"
+
+        # 2. Dog request (identical text, different image) -> BYPASS (NOT HIT-L1_EXACT)
+        res_dog = c.post("/v1/chat/completions", json=dog_req, headers=ALPHA_HEADERS)
+        assert res_dog.status_code == 200
+        assert res_dog.headers.get("x-gateway-cache-status") == "BYPASS"
+        assert res_dog.headers.get("x-gateway-bypass-reason") == "multimodal"
+
+        # 3. Text-only list-content request must still be cacheable
+        text_req = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "explain quantum computing in one sentence"}
+                    ]
+                }
+            ]
+        }
+        res_text_1 = c.post("/v1/chat/completions", json=text_req, headers=ALPHA_HEADERS)
+        assert res_text_1.status_code == 200
+        assert res_text_1.headers.get("x-gateway-cache-status") == "MISS"
+
+        res_text_2 = c.post("/v1/chat/completions", json=text_req, headers=ALPHA_HEADERS)
+        assert res_text_2.status_code == 200
+        assert res_text_2.headers.get("x-gateway-cache-status") == "HIT-L1_EXACT"
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -1099,6 +1161,7 @@ if __name__ == "__main__":
     test_tools_are_forwarded_and_bypass_cache()
     test_agent_loop_messages_accepted()
     test_list_content_and_none_content_do_not_crash()
+    test_multimodal_requests_bypass_cache_and_text_only_cached()
     print("\nALL PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 

@@ -501,6 +501,10 @@ class SemanticCache:
                     return False, f"message role '{m.role}'"
                 if m.tool_calls:
                     return False, "tool_calls"
+                if isinstance(m.content, list):
+                    for part in m.content:
+                        if not isinstance(part, dict) or part.get("type") != "text":
+                            return False, "multimodal"
 
         if request.n is not None and request.n > 1:
             return False, "n > 1"
