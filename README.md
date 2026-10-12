@@ -249,10 +249,10 @@ Output:
    - **Explicit Negation Checking**: Rejects matches across `not`, `can't`, `never`, `without`.
    - **31 Antonym Polarity Classes with Inflection**: Rejects opposing actions (`enable/disable`, `buy/sell`, `login/logout`, `turn on/off`, `free/paid`, `public/private`, `monthly/yearly`, `today/tomorrow`, `before/after`, `first/last`, `inbound/outbound`).
 
-5. **Known Limits & Defense-in-Depth**:
-   - **Dynamic, Personal & Side-Effecting Queries**: Dynamic, personal, or random queries (wallet balance, email checking, OTP generation, time-sensitive data) must be sent with `X-Bypass-Cache: true` or a short `X-Cache-TTL`. The cache is not suitable for non-idempotent or side-effecting operations.
-   - **Entity Swaps**: Dense embeddings naturally compress syntactic nuances. Rule-based guards handle known high-risk antonyms and numerical invariants, but arbitrary entity swaps (e.g., *Netflix* vs *Hotstar*) rely on semantic distance.
-   - For mission-critical endpoints requiring strict entity guarantees, Aegis supports tenant-configurable threshold overrides via `X-Similarity-Threshold: 0.88` or complete bypass via `X-Bypass-Cache: true`.
+5. **Known Limits & Architectural Boundaries**:
+   - **Per-User Isolation Requires `user` Field**: Multi-user applications sharing a single tenant API key must forward the OpenAI `user` field in the request body. Without it, all requests under that tenant key share the `"shared"` cache scope.
+   - **Domain Entity Swaps (e.g., Netflix vs Hotstar, admin vs user)**: Rule-based post-embedding guards strictly enforce digit tokens, negation, and 31 polar antonym pairs, but arbitrary named-entity swaps rely on semantic vector distance. For mission-critical endpoints requiring strict entity segregation, use threshold overrides (`X-Similarity-Threshold: 0.88`) or explicit tenant partitioning.
+   - **Dynamic, Personal & Side-Effecting Queries**: Dynamic, time-sensitive, or state-changing queries (e.g. checking unread emails, live wallet balance, OTP generation) must be sent with `X-Bypass-Cache: true` or a minimal client TTL (`X-Cache-TTL`). Caching is inherently intended for read-only, idempotent workflows.
 
 ---
 
