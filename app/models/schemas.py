@@ -3,10 +3,30 @@ from pydantic import BaseModel, Field, ConfigDict
 import time
 import uuid
 
+def content_to_text(content: Any) -> str:
+    """Extracts plain text string from str, list of content blocks, or None."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if text is not None:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
     role: str  # 'system', 'user', 'assistant', 'tool'
-    content: str
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -23,6 +43,7 @@ class ChatCompletionRequest(BaseModel):
     similarity_threshold: Optional[float] = None
 
 class ChatChoice(BaseModel):
+    model_config = ConfigDict(extra="allow")
     index: int = 0
     message: ChatMessage
     finish_reason: Optional[str] = "stop"
@@ -33,6 +54,7 @@ class UsageInfo(BaseModel):
     total_tokens: int = 0
 
 class ChatCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:12]}")
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))

@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings, authenticate_tenant, verify_admin_key, get_active_provider_info, DEV_MODE
-from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo, GatewayMetricsResponse
+from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo, GatewayMetricsResponse, content_to_text
 from app.core.rate_limiter import rate_limiter
 from app.core.semantic_cache import semantic_cache
 from app.core.circuit_breaker import circuit_breaker, CircuitState
@@ -127,7 +127,48 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
     raw_thresh = request.headers.get("X-Similarity-Threshold")
     custom_thresh = float(raw_thresh) if raw_thresh else req.similarity_threshold
 
-    # 4. Check Tiered Multi-Tenant Cache (L1 Exact & L2 Semantic Cosine Match)
+    # 4. Check cacheability (bypass for tools, tool messages, n > 1)
+    cacheable, bypass_reason = semantic_cache.is_cacheable(req)
+    if not cacheable:
+        if req.stream:
+            stream_gen, provider_name = await proxy_client.forward_stream(req)
+
+            async def stream_bypass_wrapper():
+                try:
+                    async for line in stream_gen:
+                        yield line
+                finally:
+                    latency_ms = (time.monotonic() - start_time) * 1000.0
+                    metrics_tracker.record_request(latency_ms, cache_type=None)
+
+            stream_headers = {
+                "X-Gateway-Tenant-Id": tenant_id,
+                "X-Gateway-Cache-Status": "BYPASS",
+                "X-Gateway-Bypass-Reason": bypass_reason,
+                "X-Gateway-Provider": provider_name,
+                "X-Gateway-Dense-Active": str(semantic_cache.is_dense_active).lower(),
+                "Content-Type": "text/event-stream"
+            }
+            return StreamingResponse(stream_bypass_wrapper(), media_type="text/event-stream", headers=stream_headers)
+
+        upstream_resp, provider = await proxy_client.forward(req)
+        latency_ms = (time.monotonic() - start_time) * 1000.0
+        upstream_resp.latency_ms = round(latency_ms, 2)
+        upstream_resp.provider = provider
+        upstream_resp.cached = False
+        upstream_resp.similarity_score = 0.0
+
+        metrics_tracker.record_request(latency_ms, cache_type=None)
+
+        response.headers["X-Gateway-Tenant-Id"] = tenant_id
+        response.headers["X-Gateway-Cache-Status"] = "BYPASS"
+        response.headers["X-Gateway-Bypass-Reason"] = bypass_reason
+        response.headers["X-Gateway-Latency-Ms"] = str(round(latency_ms, 2))
+        response.headers["X-Gateway-Provider"] = provider
+        response.headers["X-Gateway-Dense-Active"] = str(semantic_cache.is_dense_active).lower()
+        return upstream_resp
+
+    # 5. Check Tiered Multi-Tenant Cache (L1 Exact & L2 Semantic Cosine Match)
     cached_resp, cache_type, similarity_score = await semantic_cache.get(
         req,
         tenant_id=tenant_id,
@@ -140,7 +181,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
         if cached_resp:
             # Stream from in-memory cached response with simulated typewriter emission
             async def stream_cached_chunks():
-                full_text = cached_resp.choices[0].message.content
+                full_text = content_to_text(cached_resp.choices[0].message.content)
                 words = full_text.split(" ")
                 chunk_id = f"chatcmpl-cached-{uuid.uuid4().hex[:8]}"
                 
@@ -203,7 +244,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, respons
             finally:
                 if accumulated_chunks:
                     full_content = "".join(accumulated_chunks)
-                    p_tokens = sum(len(m.content.split()) for m in req.messages) + 10
+                    p_tokens = sum(len(content_to_text(m.content).split()) for m in req.messages) + 10
                     c_tokens = len(full_content.split()) + 5
                     reconstructed = ChatCompletionResponse(
                         model=req.model,

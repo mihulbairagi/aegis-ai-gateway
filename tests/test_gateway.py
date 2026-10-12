@@ -17,6 +17,11 @@ from app.core.rate_limiter import rate_limiter
 from app.core.circuit_breaker import circuit_breaker, CircuitState
 from app.core.semantic_cache import semantic_cache
 from app.core.storage import sqlite_storage
+try:
+    from app.core.proxy import proxy
+except ImportError:
+    from app.core.proxy import proxy_client as proxy
+from app.models.schemas import ChatCompletionResponse, ChatChoice, ChatMessage
 
 client = TestClient(app)
 
@@ -949,6 +954,114 @@ def test_truncated_responses_not_cached():
         proxy.forward = orig_forward
 
 
+def test_tools_are_forwarded_and_bypass_cache():
+    """Verify tool-enabled requests bypass cache and tools are forwarded to upstream."""
+    reset_state()
+    tools_payload = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "description": "Get current weather in location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                }
+            }
+        }
+    ]
+    req = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+        "tools": tools_payload
+    }
+
+    captured_payloads = []
+    orig_is_live = proxy._is_live_key
+    orig_call = proxy._call_upstream
+    proxy._is_live_key = lambda key: True
+
+    async def mock_call(url, api_key, payload):
+        captured_payloads.append(payload)
+        return ChatCompletionResponse(
+            model=payload.get("model", "gpt-4o-mini"),
+            choices=[ChatChoice(message=ChatMessage(role="assistant", content="Weather is 72F"))]
+        )
+
+    proxy._call_upstream = mock_call
+    try:
+        with TestClient(app) as c:
+            # 1. First request -> 200, BYPASS
+            res1 = c.post("/v1/chat/completions", json=req, headers=ALPHA_HEADERS)
+            assert res1.status_code == 200
+            assert res1.headers.get("x-gateway-cache-status") == "BYPASS"
+            assert res1.headers.get("x-gateway-bypass-reason") == "tools"
+
+            # 2. Repeat request -> 200, still BYPASS (never cached)
+            res2 = c.post("/v1/chat/completions", json=req, headers=ALPHA_HEADERS)
+            assert res2.status_code == 200
+            assert res2.headers.get("x-gateway-cache-status") == "BYPASS"
+            assert res2.headers.get("x-gateway-bypass-reason") == "tools"
+
+            # Both requests went upstream
+            assert len(captured_payloads) == 2
+            assert "tools" in captured_payloads[0]
+            assert captured_payloads[0]["tools"] == tools_payload
+    finally:
+        proxy._is_live_key = orig_is_live
+        proxy._call_upstream = orig_call
+
+
+def test_agent_loop_messages_accepted():
+    """Verify assistant message with content=None + tool_calls and tool messages return 200 and BYPASS."""
+    reset_state()
+    tool_call_item = {
+        "id": "call_tokyo_123",
+        "type": "function",
+        "function": {"name": "get_current_weather", "arguments": '{"location": "Tokyo"}'}
+    }
+    req = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "user", "content": "What is the weather in Tokyo?"},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call_item]},
+            {"role": "tool", "content": "72F and sunny", "tool_call_id": "call_tokyo_123"}
+        ]
+    }
+    with TestClient(app) as c:
+        res = c.post("/v1/chat/completions", json=req, headers=ALPHA_HEADERS)
+        assert res.status_code == 200
+        assert res.headers.get("x-gateway-cache-status") == "BYPASS"
+
+
+def test_list_content_and_none_content_do_not_crash():
+    """Verify list content blocks and None content do not crash prompt extraction or token counters."""
+    reset_state()
+    with TestClient(app) as c:
+        # 1. Content as list of content blocks
+        req1 = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        }
+        res1 = c.post("/v1/chat/completions", json=req1, headers=ALPHA_HEADERS)
+        assert res1.status_code == 200
+
+        # 2. Content as None (in conversation turn)
+        req2 = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": None},
+                {"role": "user", "content": "continue"}
+            ]
+        }
+        res2 = c.post("/v1/chat/completions", json=req2, headers=ALPHA_HEADERS)
+        assert res2.status_code == 200
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -983,6 +1096,10 @@ if __name__ == "__main__":
     test_user_isolation_survives_restart()
     test_sampling_params_are_part_of_cache_key()
     test_truncated_responses_not_cached()
+    test_tools_are_forwarded_and_bypass_cache()
+    test_agent_loop_messages_accepted()
+    test_list_content_and_none_content_do_not_crash()
     print("\nALL PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+
 
 

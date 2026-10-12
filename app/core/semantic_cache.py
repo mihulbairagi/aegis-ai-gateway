@@ -10,7 +10,7 @@ from typing import Optional, Tuple, List, Dict, Set
 import numpy as np
 
 from app.config import settings
-from app.models.schemas import ChatCompletionResponse, ChatCompletionRequest
+from app.models.schemas import ChatCompletionResponse, ChatCompletionRequest, content_to_text
 from app.core.storage import sqlite_storage
 
 logger = logging.getLogger(__name__)
@@ -478,9 +478,38 @@ class SemanticCache:
         canonical_json = json.dumps(filtered, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(canonical_json.encode()).hexdigest()[:16]
 
+    def is_cacheable(self, request: ChatCompletionRequest) -> Tuple[bool, str]:
+        """
+        Determines whether a request can be safely cached.
+        Returns (False, reason) if the request involves tools, non-idempotent operations, or n > 1.
+        """
+        tools = getattr(request, "tools", None)
+        if tools:
+            return False, "tools"
+
+        functions = getattr(request, "functions", None)
+        if functions:
+            return False, "functions"
+
+        tool_choice = getattr(request, "tool_choice", None)
+        if tool_choice:
+            return False, "tool_choice"
+
+        if request.messages:
+            for m in request.messages:
+                if m.role in {"tool", "function"}:
+                    return False, f"message role '{m.role}'"
+                if m.tool_calls:
+                    return False, "tool_calls"
+
+        if request.n is not None and request.n > 1:
+            return False, "n > 1"
+
+        return True, ""
+
     def _extract_prompt_text(self, request: ChatCompletionRequest) -> str:
         """Extracts concatenated prompt messages for hashing and embedding."""
-        return "\n".join([f"{m.role}:{m.content}" for m in request.messages])
+        return "\n".join([f"{m.role}:{content_to_text(m.content)}" for m in request.messages])
 
     def _split_request_prompt(self, request: ChatCompletionRequest) -> Tuple[str, str, str]:
         """
@@ -491,14 +520,14 @@ class SemanticCache:
         - sys_hash: 16-char SHA256 of system instructions or 'none' (for strict persona isolation)
         - semantic_text: user/assistant conversation intent without system prompt dilution
         """
-        full_prompt = "\n".join([f"{m.role}:{m.content}" for m in request.messages])
-        sys_parts = [m.content for m in request.messages if m.role in ("system", "developer")]
+        full_prompt = "\n".join([f"{m.role}:{content_to_text(m.content)}" for m in request.messages])
+        sys_parts = [content_to_text(m.content) for m in request.messages if m.role in ("system", "developer")]
         if sys_parts:
             sys_hash = hashlib.sha256("\n".join(sys_parts).encode()).hexdigest()[:16]
         else:
             sys_hash = "none"
 
-        semantic_parts = [f"{m.role}:{m.content}" for m in request.messages if m.role not in ("system", "developer")]
+        semantic_parts = [f"{m.role}:{content_to_text(m.content)}" for m in request.messages if m.role not in ("system", "developer")]
         if semantic_parts:
             semantic_text = "\n".join(semantic_parts).strip()
         else:
@@ -623,8 +652,16 @@ class SemanticCache:
         if bypass_cache:
             return
 
+        cacheable, _ = self.is_cacheable(request)
+        if not cacheable:
+            return
+
         # Only cache when every choice has finish_reason == "stop"
         if not response.choices or not all(c.finish_reason == "stop" for c in response.choices):
+            return
+
+        # Responses containing tool_calls must never be stored
+        if any(getattr(c.message, "tool_calls", None) for c in response.choices):
             return
 
         now = time.time()

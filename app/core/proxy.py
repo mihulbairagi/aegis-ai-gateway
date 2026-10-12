@@ -6,7 +6,7 @@ import httpx
 from typing import Tuple, Dict, Any, Optional, AsyncGenerator
 from fastapi import HTTPException
 from app.config import settings, get_active_provider_info
-from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo
+from app.models.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, UsageInfo, content_to_text
 from app.core.circuit_breaker import circuit_breaker
 
 class UpstreamProxy:
@@ -133,7 +133,7 @@ class UpstreamProxy:
         route: str
     ) -> AsyncGenerator[str, None]:
         """Simulates token-by-token OpenAI SSE streaming for offline/testing use."""
-        last_msg = request.messages[-1].content if request.messages else "Hello"
+        last_msg = content_to_text(request.messages[-1].content) if request.messages else "Hello"
         answer = f"Processed response for: '{last_msg[:60]}...' via {route} engine."
         words = answer.split()
         chunk_id = f"chatcmpl-stream-{uuid.uuid4().hex[:8]}"
@@ -207,10 +207,10 @@ class UpstreamProxy:
 
     async def _call_simulated_upstream(self, request: ChatCompletionRequest, route: str) -> Tuple[ChatCompletionResponse, str]:
         """Simulated upstream response (for testing and offline benchmarking)."""
-        last_msg = request.messages[-1].content if request.messages else "Hello"
+        last_msg = content_to_text(request.messages[-1].content) if request.messages else "Hello"
         answer = f"Processed response for: '{last_msg[:60]}...' via {route} engine."
 
-        prompt_tokens = sum(len(m.content.split()) for m in request.messages) + 10
+        prompt_tokens = sum(len(content_to_text(m.content).split()) for m in request.messages) + 10
         completion_tokens = len(answer.split()) + 5
 
         resp = ChatCompletionResponse(

@@ -197,11 +197,14 @@ for chunk in stream:
 
 ## Verification & Automated Test Suite
 
-Aegis includes 29 automated production unit and integration tests verifying all core subsystems:
+Aegis includes 36 automated production unit and integration tests verifying all core subsystems:
 - Multi-tenant partition isolation & dev-mode security gates
 - FastEmbed ONNX dense semantic caching & sweet-spot threshold
 - System prompt dilution prevention & persona hash partition isolation
 - Multi-line persona persistence across restarts & forgery immunity
+- Per-user cache isolation (`user_scope`) across restarts
+- Sampling parameter isolation (`params_hash`) and truncation exclusion (`finish_reason == "length"`)
+- Tool-calling passthrough, agent loop message acceptance, and cache bypass (`X-Gateway-Cache-Status: BYPASS`)
 - Pre-embedding lexical & typo normalization (human slips)
 - Post-embedding entity number, negation, and 31 antonym polarity guards
 - Circuit breaker auto-failover, half-open probe limiting, and self-heal
@@ -213,7 +216,7 @@ pytest tests/ -v
 
 Output:
 ```text
-======================== 29 passed, 1 warning in 6.83s ========================
+======================== 36 passed, 1 warning in 7.23s ========================
 ```
 
 ---
@@ -230,13 +233,23 @@ Output:
      - On restart, warmup reads stored columns directly rather than naively re-parsing serialized text lines, ensuring multi-line system prompts and forged user messages (`"x\nsystem:..."`) never corrupt persona boundaries.
    - **Per-User Cache Scope**: Multi-user apps behind a single tenant key must send the OpenAI `user` field; without it all requests of the tenant share one cache scope.
 
-2. **Multi-Factor Post-Embedding Guard**:
+2. **Sampling Parameters in Cache Key & Truncation Exclusion**:
+   - Sampling parameters (`max_tokens`, `top_p`, `n`, `stop`, `seed`, `response_format`, penalties) are canonically hashed into `params_hash` and partitioned in both L1 exact and L2 semantic caches. Varying generation configurations never collide.
+   - Truncated completions (`finish_reason == "length"`) are strictly excluded from cache storage to avoid serving truncated responses to subsequent requests.
+
+3. **Tool Calling & Agent Loop Cache Bypass**:
+   - Requests containing `tools`, `functions`, `tool_choice`, or agent loop message roles (`tool`, `function`, assistant tool calls) or `n > 1` automatically bypass the cache (`X-Gateway-Cache-Status: BYPASS`, with reason specified in `X-Gateway-Bypass-Reason`).
+   - Responses containing `tool_calls` pass through to the client unchanged and are never stored in cache.
+   - OpenAI schema fields and multimodal content blocks (`[{"type": "text", "text": "..."}]`) are handled without crashing.
+
+4. **Multi-Factor Post-Embedding Guard**:
    - **Alphanumeric & Number-Word Integrity**: Strict equality on digit tokens (`500rs` vs `5000rs`, `10gb` vs `100gb`, `python3` vs `python2`, `five hundred` vs `five thousand`).
    - **Explicit Negation Checking**: Rejects matches across `not`, `can't`, `never`, `without`.
    - **31 Antonym Polarity Classes with Inflection**: Rejects opposing actions (`enable/disable`, `buy/sell`, `login/logout`, `turn on/off`, `free/paid`, `public/private`, `monthly/yearly`, `today/tomorrow`, `before/after`, `first/last`, `inbound/outbound`).
 
-3. **Known Boundaries & Defense-in-Depth**:
-   - Dense embeddings naturally compress syntactic nuances. Rule-based guards handle known high-risk antonyms and numerical invariants, but arbitrary entity swaps (e.g., *Netflix* vs *Hotstar*) rely on semantic distance.
+5. **Known Limits & Defense-in-Depth**:
+   - **Dynamic, Personal & Side-Effecting Queries**: Dynamic, personal, or random queries (wallet balance, email checking, OTP generation, time-sensitive data) must be sent with `X-Bypass-Cache: true` or a short `X-Cache-TTL`. The cache is not suitable for non-idempotent or side-effecting operations.
+   - **Entity Swaps**: Dense embeddings naturally compress syntactic nuances. Rule-based guards handle known high-risk antonyms and numerical invariants, but arbitrary entity swaps (e.g., *Netflix* vs *Hotstar*) rely on semantic distance.
    - For mission-critical endpoints requiring strict entity guarantees, Aegis supports tenant-configurable threshold overrides via `X-Similarity-Threshold: 0.88` or complete bypass via `X-Bypass-Cache: true`.
 
 ---
