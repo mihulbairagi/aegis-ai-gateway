@@ -417,8 +417,11 @@ class SemanticCache:
                 l1_key = f"{tenant_id}:{model}:{temp}:{prompt_hash}"
                 self.l1_cache[l1_key] = (resp, created_at, ttl)
 
-                if vector is not None and len(vector) == self.embedder.dim:
-                    sys_hash, semantic_text = self._split_raw_prompt_text(prompt)
+                # Legacy rows (written before sys_hash/semantic_text were persisted) embedded the
+                # system-diluted prompt; keep them in L1 (exact) but never in L2 (semantic).
+                sys_hash = r.get("sys_hash")
+                semantic_text = r.get("semantic_text")
+                if vector is not None and len(vector) == self.embedder.dim and sys_hash and semantic_text:
                     partition = self._get_partition(tenant_id)
                     partition.vectors.append(vector)
                     partition.entries.append(resp)
@@ -464,32 +467,6 @@ class SemanticCache:
             semantic_text = full_prompt
 
         return full_prompt, sys_hash, semantic_text
-
-    def _split_raw_prompt_text(self, prompt_text: str) -> Tuple[str, str]:
-        """
-        Splits a serialized prompt string into (sys_hash, semantic_text).
-        Used during SQLite warmup.
-        """
-        lines = prompt_text.split("\n")
-        sys_lines = []
-        semantic_lines = []
-        for line in lines:
-            if line.startswith("system:") or line.startswith("developer:"):
-                parts = line.split(":", 1)
-                sys_lines.append(parts[1] if len(parts) > 1 else line)
-            else:
-                semantic_lines.append(line)
-
-        if sys_lines:
-            sys_hash = hashlib.sha256("\n".join(sys_lines).encode()).hexdigest()[:16]
-        else:
-            sys_hash = "none"
-
-        semantic_text = "\n".join(semantic_lines).strip()
-        if not semantic_text:
-            semantic_text = prompt_text
-
-        return sys_hash, semantic_text
 
     def _get_l1_key(self, request: ChatCompletionRequest, tenant_id: str) -> str:
         """Partitioned L1 cache key strictly bound to tenant_id, model, and temperature."""
@@ -645,7 +622,9 @@ class SemanticCache:
             resp_json,
             vec,
             now,
-            ttl
+            ttl,
+            sys_hash,
+            semantic_text,
         ))
 
     async def purge_expired(self) -> int:

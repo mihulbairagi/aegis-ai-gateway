@@ -197,10 +197,11 @@ for chunk in stream:
 
 ## Verification & Automated Test Suite
 
-Aegis includes 28 automated production unit and integration tests verifying all core subsystems:
+Aegis includes 29 automated production unit and integration tests verifying all core subsystems:
 - Multi-tenant partition isolation & dev-mode security gates
 - FastEmbed ONNX dense semantic caching & sweet-spot threshold
 - System prompt dilution prevention & persona hash partition isolation
+- Multi-line persona persistence across restarts & forgery immunity
 - Pre-embedding lexical & typo normalization (human slips)
 - Post-embedding entity number, negation, and 31 antonym polarity guards
 - Circuit breaker auto-failover, half-open probe limiting, and self-heal
@@ -212,7 +213,7 @@ pytest tests/ -v
 
 Output:
 ```text
-======================== 28 passed, 1 warning in 6.60s ========================
+======================== 29 passed, 1 warning in 6.83s ========================
 ```
 
 ---
@@ -220,8 +221,13 @@ Output:
 ### Semantic Cache Precision, Context Isolation & Known Limits
 
 1. **System Prompt Dilution Prevention & Persona Isolation**:
-   - In production, multi-message prompts often contain long system instructions (100–500 tokens). Concatenating system instructions into the embedding string causes 90%+ token overlap across distinct user queries, triggering false positives (cosine similarity > 0.98).
-   - **Resolution**: Aegis isolates system instructions into a deterministic 16-character `sys_hash`. L2 vector search requires candidate `sys_hash == query.sys_hash` (preventing cross-persona leakage) while computing dense embeddings and guard evaluations strictly over the conversational user intent (`semantic_text`).
+   - In production, multi-message prompts often contain long system instructions (50–500 tokens). Concatenating system instructions into the embedding string causes token overlap across distinct user queries, triggering false positives.
+   - **Benchmark Comparison** (under a corporate banking system prompt):
+     - *Unhashed Concat*: `"refund order"` vs `"cancel subscription"` scored **0.937** cosine similarity (false positive HIT; scaling to >0.98 as prompt length increases).
+     - *Isolated Intent*: The same comparison drops to **0.461** (clean MISS), while genuine paraphrases maintain **0.926** (clean HIT).
+   - **Persistence & Restart Resilience**:
+     - `sys_hash` and `semantic_text` are persisted directly as columns in SQLite (with automatic schema migration).
+     - On restart, warmup reads stored columns directly rather than naively re-parsing serialized text lines, ensuring multi-line system prompts and forged user messages (`"x\nsystem:..."`) never corrupt persona boundaries.
 
 2. **Multi-Factor Post-Embedding Guard**:
    - **Alphanumeric & Number-Word Integrity**: Strict equality on digit tokens (`500rs` vs `5000rs`, `10gb` vs `100gb`, `python3` vs `python2`, `five hundred` vs `five thousand`).

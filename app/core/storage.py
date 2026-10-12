@@ -44,6 +44,12 @@ class SQLiteCacheStorage:
                     ttl REAL DEFAULT 300.0
                 );
             """)
+            # Migration: persist the already-computed persona hash and embedded text, so warmup never
+            # has to re-parse the serialized prompt (which breaks on multi-line / forged content).
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(semantic_cache)")}
+            for col in ("sys_hash", "semantic_text"):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE semantic_cache ADD COLUMN {col} TEXT")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tenant_model 
                 ON semantic_cache(tenant_id, model, temperature);
@@ -57,7 +63,8 @@ class SQLiteCacheStorage:
             with self._get_connection() as conn:
                 cursor = conn.execute("""
                     SELECT id, tenant_id, model, temperature, prompt, 
-                           response_json, embedding, created_at, hits, ttl 
+                           response_json, embedding, created_at, hits, ttl,
+                           sys_hash, semantic_text
                     FROM semantic_cache
                 """)
                 for row in cursor.fetchall():
@@ -73,7 +80,9 @@ class SQLiteCacheStorage:
                         "vector": vector,
                         "created_at": row["created_at"],
                         "hits": row["hits"],
-                        "ttl": row["ttl"]
+                        "ttl": row["ttl"],
+                        "sys_hash": row["sys_hash"],
+                        "semantic_text": row["semantic_text"],
                     })
         except Exception as e:
             logger.warning(f"Failed to load cache warmup from SQLite: {e}")
@@ -89,7 +98,9 @@ class SQLiteCacheStorage:
         response_json: str,
         embedding: np.ndarray,
         created_at: float,
-        ttl: float
+        ttl: float,
+        sys_hash: Optional[str] = None,
+        semantic_text: Optional[str] = None,
     ):
         """Persists a new cache entry and its ONNX dense vector."""
         emb_bytes = embedding.astype(np.float32).tobytes() if embedding is not None else b""
@@ -97,8 +108,9 @@ class SQLiteCacheStorage:
             with self._get_connection() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO semantic_cache 
-                    (id, tenant_id, model, temperature, prompt, response_json, embedding, created_at, hits, ttl)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    (id, tenant_id, model, temperature, prompt, response_json, embedding, created_at, hits, ttl,
+                     sys_hash, semantic_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """, (
                     cache_id,
                     tenant_id,
@@ -108,7 +120,9 @@ class SQLiteCacheStorage:
                     response_json,
                     emb_bytes,
                     created_at,
-                    ttl
+                    ttl,
+                    sys_hash,
+                    semantic_text,
                 ))
                 conn.commit()
         except Exception as e:
