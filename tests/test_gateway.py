@@ -883,6 +883,72 @@ def test_user_isolation_survives_restart():
         assert res_alice.headers.get("x-gateway-cache-status", "").startswith("HIT")
 
 
+def test_sampling_params_are_part_of_cache_key():
+    reset_state()
+    prompt = "explain quantum computing in one sentence"
+    req_5 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 5}
+    req_500 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500}
+
+    with TestClient(app) as c:
+        # First with max_tokens=5 -> MISS
+        res1 = c.post("/v1/chat/completions", json=req_5, headers=ALPHA_HEADERS)
+        assert res1.status_code == 200
+        assert not res1.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Then with max_tokens=500 -> MISS (different params_hash)
+        res2 = c.post("/v1/chat/completions", json=req_500, headers=ALPHA_HEADERS)
+        assert res2.status_code == 200
+        assert not res2.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Same max_tokens=500 twice -> HIT
+        res3 = c.post("/v1/chat/completions", json=req_500, headers=ALPHA_HEADERS)
+        assert res3.status_code == 200
+        assert res3.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Also check top_p
+        req_topp_1 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "top_p": 0.5}
+        req_topp_2 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "top_p": 0.9}
+        res_topp1 = c.post("/v1/chat/completions", json=req_topp_1, headers=ALPHA_HEADERS)
+        assert not res_topp1.headers.get("x-gateway-cache-status", "").startswith("HIT")
+        res_topp2 = c.post("/v1/chat/completions", json=req_topp_2, headers=ALPHA_HEADERS)
+        assert not res_topp2.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Also check stop
+        req_stop_1 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "stop": ["\n"]}
+        req_stop_2 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "stop": ["END"]}
+        res_stop1 = c.post("/v1/chat/completions", json=req_stop_1, headers=ALPHA_HEADERS)
+        assert not res_stop1.headers.get("x-gateway-cache-status", "").startswith("HIT")
+        res_stop2 = c.post("/v1/chat/completions", json=req_stop_2, headers=ALPHA_HEADERS)
+        assert not res_stop2.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+
+def test_truncated_responses_not_cached():
+    reset_state()
+    from app.core.proxy import proxy
+    orig_forward = proxy.forward
+
+    async def mock_forward(request):
+        resp, provider = await orig_forward(request)
+        resp.choices[0].finish_reason = "length"
+        return resp, provider
+
+    proxy.forward = mock_forward
+    try:
+        req = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "tell me a long story"}]}
+        with TestClient(app) as c:
+            res1 = c.post("/v1/chat/completions", json=req, headers=ALPHA_HEADERS)
+            assert res1.status_code == 200
+            assert res1.json()["choices"][0]["finish_reason"] == "length"
+            assert not res1.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+            # Repeat request must be a MISS because truncated response was NOT cached
+            res2 = c.post("/v1/chat/completions", json=req, headers=ALPHA_HEADERS)
+            assert res2.status_code == 200
+            assert not res2.headers.get("x-gateway-cache-status", "").startswith("HIT")
+    finally:
+        proxy.forward = orig_forward
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -915,6 +981,8 @@ if __name__ == "__main__":
     test_persona_isolation_survives_restart_multiline_and_forged()
     test_users_do_not_share_cache()
     test_user_isolation_survives_restart()
+    test_sampling_params_are_part_of_cache_key()
+    test_truncated_responses_not_cached()
     print("\nALL PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 

@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 import time
 import uuid
 
@@ -9,6 +9,7 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     model: str = "gpt-4o-mini"
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7

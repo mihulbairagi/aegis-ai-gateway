@@ -232,3 +232,4 @@ class UpstreamProxy:
         return resp, f"upstream_{route}"
 
 proxy_client = UpstreamProxy()
+proxy = proxy_client

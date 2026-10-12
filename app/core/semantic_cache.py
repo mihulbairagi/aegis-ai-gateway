@@ -309,6 +309,7 @@ class TenantL2Partition:
         self.semantic_prompts: List[str] = []
         self.sys_hashes: List[str] = []
         self.user_scopes: List[str] = []
+        self.params_hashes: List[str] = []
         self.models: List[str] = []
         self.temperatures: List[float] = []
         self.timestamps: List[float] = []
@@ -325,6 +326,8 @@ class TenantL2Partition:
                 self.sys_hashes.pop(0)
             if self.user_scopes:
                 self.user_scopes.pop(0)
+            if self.params_hashes:
+                self.params_hashes.pop(0)
             self.models.pop(0)
             self.temperatures.pop(0)
             self.timestamps.pop(0)
@@ -337,6 +340,7 @@ class TenantL2Partition:
         self.semantic_prompts.clear()
         self.sys_hashes.clear()
         self.user_scopes.clear()
+        self.params_hashes.clear()
         self.models.clear()
         self.temperatures.clear()
         self.timestamps.clear()
@@ -353,6 +357,7 @@ class TenantL2Partition:
             self.semantic_prompts = [self.semantic_prompts[i] for i in keep]
             self.sys_hashes = [self.sys_hashes[i] for i in keep]
             self.user_scopes = [self.user_scopes[i] for i in keep]
+            self.params_hashes = [self.params_hashes[i] for i in keep]
             self.models = [self.models[i] for i in keep]
             self.temperatures = [self.temperatures[i] for i in keep]
             self.timestamps = [self.timestamps[i] for i in keep]
@@ -438,6 +443,7 @@ class SemanticCache:
                     partition.semantic_prompts.append(semantic_text)
                     partition.sys_hashes.append(sys_hash)
                     partition.user_scopes.append(user_scope)
+                    partition.params_hashes.append(params_hash)
                     partition.models.append(model)
                     partition.temperatures.append(temp)
                     partition.timestamps.append(created_at)
@@ -455,6 +461,22 @@ class SemanticCache:
         if isinstance(request.user, str) and request.user:
             return hashlib.sha256(request.user.encode()).hexdigest()[:16]
         return "shared"
+
+    def _compute_params_hash(self, request: ChatCompletionRequest) -> str:
+        """
+        Computes a deterministic 16-hex sha256 hash of sampling parameters.
+        Excludes keys: messages, model, temperature, stream, stream_options,
+        user, similarity_threshold, tools, tool_choice, functions, function_call.
+        """
+        data = request.model_dump(exclude_none=True)
+        excluded_keys = {
+            "messages", "model", "temperature", "stream", "stream_options",
+            "user", "similarity_threshold", "tools", "tool_choice",
+            "functions", "function_call"
+        }
+        filtered = {k: v for k, v in data.items() if k not in excluded_keys}
+        canonical_json = json.dumps(filtered, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(canonical_json.encode()).hexdigest()[:16]
 
     def _extract_prompt_text(self, request: ChatCompletionRequest) -> str:
         """Extracts concatenated prompt messages for hashing and embedding."""
@@ -490,7 +512,7 @@ class SemanticCache:
         prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()
         temp = request.temperature if request.temperature is not None else 0.0
         user_scope = self._compute_user_scope(request)
-        params_hash = "default"
+        params_hash = self._compute_params_hash(request)
         return f"{tenant_id}:{user_scope}:{params_hash}:{request.model}:{temp}:{prompt_hash}"
 
     async def get(
@@ -517,7 +539,7 @@ class SemanticCache:
         full_prompt, sys_hash, semantic_text = self._split_request_prompt(request)
         req_temp = request.temperature if request.temperature is not None else 0.0
         user_scope = self._compute_user_scope(request)
-        params_hash = "default"
+        params_hash = self._compute_params_hash(request)
 
         # 1. Check Tier 1 (L1 Exact Match on full prompt)
         prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()
@@ -539,13 +561,14 @@ class SemanticCache:
         # 2. Check Tier 2 (L2 Semantic Cosine Similarity within tenant partition)
         partition = self._get_partition(tenant_id)
         if len(partition.vectors) > 0:
-            # Find candidate indices matching model, temperature, system persona hash, user scope, and valid TTL
+            # Find candidate indices matching model, temperature, system persona hash, user scope, params_hash, and valid TTL
             candidate_indices = [
                 i for i in range(len(partition.vectors))
                 if partition.models[i] == request.model
                 and abs(partition.temperatures[i] - req_temp) < 1e-4
                 and (partition.sys_hashes[i] == sys_hash if partition.sys_hashes else True)
                 and (partition.user_scopes[i] == user_scope if partition.user_scopes else True)
+                and (partition.params_hashes[i] == params_hash if partition.params_hashes else True)
                 and (now - partition.timestamps[i] <= partition.ttls[i])
             ]
 
@@ -600,6 +623,10 @@ class SemanticCache:
         if bypass_cache:
             return
 
+        # Only cache when every choice has finish_reason == "stop"
+        if not response.choices or not all(c.finish_reason == "stop" for c in response.choices):
+            return
+
         now = time.time()
         ttl = ttl_seconds if ttl_seconds is not None and ttl_seconds > 0 else self.default_ttl
         ttl = min(ttl, settings.CACHE_MAX_TTL_SECONDS)
@@ -607,7 +634,7 @@ class SemanticCache:
         full_prompt, sys_hash, semantic_text = self._split_request_prompt(request)
         req_temp = request.temperature if request.temperature is not None else 0.0
         user_scope = self._compute_user_scope(request)
-        params_hash = "default"
+        params_hash = self._compute_params_hash(request)
 
         # Store in L1
         prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()
@@ -629,6 +656,7 @@ class SemanticCache:
         partition.semantic_prompts.append(semantic_text)
         partition.sys_hashes.append(sys_hash)
         partition.user_scopes.append(user_scope)
+        partition.params_hashes.append(params_hash)
         partition.models.append(request.model)
         partition.temperatures.append(req_temp)
         partition.timestamps.append(now)
