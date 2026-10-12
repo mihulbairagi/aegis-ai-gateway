@@ -308,6 +308,7 @@ class TenantL2Partition:
         self.prompts: List[str] = []
         self.semantic_prompts: List[str] = []
         self.sys_hashes: List[str] = []
+        self.user_scopes: List[str] = []
         self.models: List[str] = []
         self.temperatures: List[float] = []
         self.timestamps: List[float] = []
@@ -322,6 +323,8 @@ class TenantL2Partition:
                 self.semantic_prompts.pop(0)
             if self.sys_hashes:
                 self.sys_hashes.pop(0)
+            if self.user_scopes:
+                self.user_scopes.pop(0)
             self.models.pop(0)
             self.temperatures.pop(0)
             self.timestamps.pop(0)
@@ -333,6 +336,7 @@ class TenantL2Partition:
         self.prompts.clear()
         self.semantic_prompts.clear()
         self.sys_hashes.clear()
+        self.user_scopes.clear()
         self.models.clear()
         self.temperatures.clear()
         self.timestamps.clear()
@@ -348,6 +352,7 @@ class TenantL2Partition:
             self.prompts = [self.prompts[i] for i in keep]
             self.semantic_prompts = [self.semantic_prompts[i] for i in keep]
             self.sys_hashes = [self.sys_hashes[i] for i in keep]
+            self.user_scopes = [self.user_scopes[i] for i in keep]
             self.models = [self.models[i] for i in keep]
             self.temperatures = [self.temperatures[i] for i in keep]
             self.timestamps = [self.timestamps[i] for i in keep]
@@ -413,12 +418,16 @@ class SemanticCache:
                 created_at = float(r["created_at"])
                 vector = r["vector"]
 
-                prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-                l1_key = f"{tenant_id}:{model}:{temp}:{prompt_hash}"
+                user_scope = r.get("user_scope")
+                params_hash = r.get("params_hash")
+                # Legacy rows missing user_scope or params_hash must NOT enter L1 or L2 on warmup
+                if not user_scope or not params_hash:
+                    continue
+
+                # On warmup use the stored row id as the L1 key instead of recomputing it
+                l1_key = r["id"]
                 self.l1_cache[l1_key] = (resp, created_at, ttl)
 
-                # Legacy rows (written before sys_hash/semantic_text were persisted) embedded the
-                # system-diluted prompt; keep them in L1 (exact) but never in L2 (semantic).
                 sys_hash = r.get("sys_hash")
                 semantic_text = r.get("semantic_text")
                 if vector is not None and len(vector) == self.embedder.dim and sys_hash and semantic_text:
@@ -428,6 +437,7 @@ class SemanticCache:
                     partition.prompts.append(prompt)
                     partition.semantic_prompts.append(semantic_text)
                     partition.sys_hashes.append(sys_hash)
+                    partition.user_scopes.append(user_scope)
                     partition.models.append(model)
                     partition.temperatures.append(temp)
                     partition.timestamps.append(created_at)
@@ -439,6 +449,12 @@ class SemanticCache:
         if tenant_id not in self.l2_partitions:
             self.l2_partitions[tenant_id] = TenantL2Partition(max_items=self.l2_max_items)
         return self.l2_partitions[tenant_id]
+
+    def _compute_user_scope(self, request: ChatCompletionRequest) -> str:
+        """Computes user scope hash if request.user is a non-empty string, else literal 'shared'."""
+        if isinstance(request.user, str) and request.user:
+            return hashlib.sha256(request.user.encode()).hexdigest()[:16]
+        return "shared"
 
     def _extract_prompt_text(self, request: ChatCompletionRequest) -> str:
         """Extracts concatenated prompt messages for hashing and embedding."""
@@ -469,11 +485,13 @@ class SemanticCache:
         return full_prompt, sys_hash, semantic_text
 
     def _get_l1_key(self, request: ChatCompletionRequest, tenant_id: str) -> str:
-        """Partitioned L1 cache key strictly bound to tenant_id, model, and temperature."""
+        """Partitioned L1 cache key strictly bound to tenant_id, user_scope, params_hash, model, and temperature."""
         prompt_text = self._extract_prompt_text(request)
         prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()
         temp = request.temperature if request.temperature is not None else 0.0
-        return f"{tenant_id}:{request.model}:{temp}:{prompt_hash}"
+        user_scope = self._compute_user_scope(request)
+        params_hash = "default"
+        return f"{tenant_id}:{user_scope}:{params_hash}:{request.model}:{temp}:{prompt_hash}"
 
     async def get(
         self,
@@ -498,10 +516,12 @@ class SemanticCache:
 
         full_prompt, sys_hash, semantic_text = self._split_request_prompt(request)
         req_temp = request.temperature if request.temperature is not None else 0.0
+        user_scope = self._compute_user_scope(request)
+        params_hash = "default"
 
         # 1. Check Tier 1 (L1 Exact Match on full prompt)
         prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()
-        l1_key = f"{tenant_id}:{request.model}:{req_temp}:{prompt_hash}"
+        l1_key = f"{tenant_id}:{user_scope}:{params_hash}:{request.model}:{req_temp}:{prompt_hash}"
         if l1_key in self.l1_cache:
             resp, created_at, ttl = self.l1_cache[l1_key]
             # Check TTL expiration
@@ -519,12 +539,13 @@ class SemanticCache:
         # 2. Check Tier 2 (L2 Semantic Cosine Similarity within tenant partition)
         partition = self._get_partition(tenant_id)
         if len(partition.vectors) > 0:
-            # Find candidate indices matching model, temperature, system persona hash, and valid TTL
+            # Find candidate indices matching model, temperature, system persona hash, user scope, and valid TTL
             candidate_indices = [
                 i for i in range(len(partition.vectors))
                 if partition.models[i] == request.model
                 and abs(partition.temperatures[i] - req_temp) < 1e-4
                 and (partition.sys_hashes[i] == sys_hash if partition.sys_hashes else True)
+                and (partition.user_scopes[i] == user_scope if partition.user_scopes else True)
                 and (now - partition.timestamps[i] <= partition.ttls[i])
             ]
 
@@ -585,10 +606,12 @@ class SemanticCache:
         
         full_prompt, sys_hash, semantic_text = self._split_request_prompt(request)
         req_temp = request.temperature if request.temperature is not None else 0.0
+        user_scope = self._compute_user_scope(request)
+        params_hash = "default"
 
         # Store in L1
         prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()
-        l1_key = f"{tenant_id}:{request.model}:{req_temp}:{prompt_hash}"
+        l1_key = f"{tenant_id}:{user_scope}:{params_hash}:{request.model}:{req_temp}:{prompt_hash}"
         if len(self.l1_cache) >= self.l1_max_items:
             self.l1_cache.popitem(last=False)
         self.l1_cache[l1_key] = (response, now, ttl)
@@ -605,6 +628,7 @@ class SemanticCache:
         partition.prompts.append(full_prompt)
         partition.semantic_prompts.append(semantic_text)
         partition.sys_hashes.append(sys_hash)
+        partition.user_scopes.append(user_scope)
         partition.models.append(request.model)
         partition.temperatures.append(req_temp)
         partition.timestamps.append(now)
@@ -625,6 +649,8 @@ class SemanticCache:
             ttl,
             sys_hash,
             semantic_text,
+            user_scope,
+            params_hash,
         ))
 
     async def purge_expired(self) -> int:

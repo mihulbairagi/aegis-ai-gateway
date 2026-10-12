@@ -795,6 +795,94 @@ def test_persona_isolation_survives_restart_multiline_and_forged():
         res3 = c.post("/v1/chat/completions", json=req(multi), headers=ALPHA_HEADERS)
         assert res3.headers.get("x-gateway-cache-status", "").startswith("HIT")
 
+
+def test_users_do_not_share_cache():
+    reset_state()
+    prompt = "what is my wallet balance"
+    req_alice = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "user": "alice"}
+    req_bob = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "user": "bob"}
+    req_shared = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]}
+
+    with TestClient(app) as c:
+        res1 = c.post("/v1/chat/completions", json=req_alice, headers=ALPHA_HEADERS)
+        assert res1.status_code == 200
+        assert not res1.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Bob with identical prompt -> MISS
+        res2 = c.post("/v1/chat/completions", json=req_bob, headers=ALPHA_HEADERS)
+        assert res2.status_code == 200
+        assert not res2.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Alice repeated -> HIT
+        res3 = c.post("/v1/chat/completions", json=req_alice, headers=ALPHA_HEADERS)
+        assert res3.status_code == 200
+        assert res3.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Request without user -> MISS (separate "shared" scope)
+        res4 = c.post("/v1/chat/completions", json=req_shared, headers=ALPHA_HEADERS)
+        assert res4.status_code == 200
+        assert not res4.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+
+def test_user_isolation_survives_restart():
+    reset_state()
+    prompt = "what is my secret token"
+    req_alice = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "user": "alice"}
+    req_bob = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "user": "bob"}
+
+    with TestClient(app) as c:
+        res = c.post("/v1/chat/completions", json=req_alice, headers=ALPHA_HEADERS)
+        assert res.status_code == 200
+        assert _wait_for_record(prompt), "alice row was never persisted"
+
+        # Insert a legacy row with NULL user_scope and NULL params_hash directly into SQLite
+        legacy_id = "tenant-alpha:legacy-row-id"
+        with sqlite_storage._get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO semantic_cache 
+                (id, tenant_id, model, temperature, prompt, response_json, embedding, created_at, hits, ttl,
+                 sys_hash, semantic_text, user_scope, params_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL)
+            """, (
+                legacy_id,
+                "tenant-alpha",
+                "gpt-4o-mini",
+                0.7,
+                "legacy prompt",
+                res.text,
+                b"",
+                time.time(),
+                300.0,
+                "sys",
+                "legacy prompt"
+            ))
+            conn.commit()
+
+        # Clear in-memory L1/L2
+        semantic_cache.l1_cache.clear()
+        for p in semantic_cache.l2_partitions.values():
+            p.clear()
+
+        # Warmup
+        semantic_cache.warmup()
+
+        # Legacy row must not be in L1 or L2
+        assert legacy_id not in semantic_cache.l1_cache
+        part = semantic_cache.l2_partitions.get("tenant-alpha")
+        if part:
+            assert "legacy prompt" not in part.prompts
+
+        # Bob must still be MISS
+        res_bob = c.post("/v1/chat/completions", json=req_bob, headers=ALPHA_HEADERS)
+        assert res_bob.status_code == 200
+        assert not res_bob.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+        # Alice must be HIT
+        res_alice = c.post("/v1/chat/completions", json=req_alice, headers=ALPHA_HEADERS)
+        assert res_alice.status_code == 200
+        assert res_alice.headers.get("x-gateway-cache-status", "").startswith("HIT")
+
+
 if __name__ == "__main__":
     test_auth_and_unauthorized_rejection()
     test_admin_endpoint_protection()
@@ -825,6 +913,8 @@ if __name__ == "__main__":
     test_guard_blocks_alnum_numbers_negation_and_extended_antonyms()
     test_system_prompt_dilution_prevention()
     test_persona_isolation_survives_restart_multiline_and_forged()
-    print("\nALL 29 PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
+    test_users_do_not_share_cache()
+    test_user_isolation_survives_restart()
+    print("\nALL PRODUCTION-HARDENED GATEWAY TESTS PASSED SUCCESSFULLY!")
 
 

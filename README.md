@@ -228,6 +228,7 @@ Output:
    - **Persistence & Restart Resilience**:
      - `sys_hash` and `semantic_text` are persisted directly as columns in SQLite (with automatic schema migration).
      - On restart, warmup reads stored columns directly rather than naively re-parsing serialized text lines, ensuring multi-line system prompts and forged user messages (`"x\nsystem:..."`) never corrupt persona boundaries.
+   - **Per-User Cache Scope**: Multi-user apps behind a single tenant key must send the OpenAI `user` field; without it all requests of the tenant share one cache scope.
 
 2. **Multi-Factor Post-Embedding Guard**:
    - **Alphanumeric & Number-Word Integrity**: Strict equality on digit tokens (`500rs` vs `5000rs`, `10gb` vs `100gb`, `python3` vs `python2`, `five hundred` vs `five thousand`).
