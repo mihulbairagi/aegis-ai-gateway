@@ -39,7 +39,10 @@ class UpstreamProxy:
         if is_live and route == "primary":
             try:
                 payload = request.model_dump(exclude_unset=True)
-                if not payload.get("model"):
+                if not payload.get("model") or (
+                    payload.get("model", "").startswith("gpt-")
+                    and "generativelanguage.googleapis.com" in active["url"]
+                ):
                     payload["model"] = active["default_model"]
 
                 response = await self._call_upstream(
@@ -85,7 +88,10 @@ class UpstreamProxy:
             try:
                 payload = request.model_dump(exclude_unset=True)
                 payload["stream"] = True
-                if not payload.get("model"):
+                if not payload.get("model") or (
+                    payload.get("model", "").startswith("gpt-")
+                    and "generativelanguage.googleapis.com" in active["url"]
+                ):
                     payload["model"] = active["default_model"]
 
                 url = f"{active['url'].rstrip('/')}/chat/completions"

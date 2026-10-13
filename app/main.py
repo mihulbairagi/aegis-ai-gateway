@@ -451,7 +451,7 @@ async def interactive_playground():
 
                 <div>
                     <label class="text-xs text-slate-400 block mb-1">Model Target</label>
-                    <input id="model" type="text" value="gpt-4o-mini" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
+                    <input id="model" type="text" value="__DEFAULT_MODEL__" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono">
                 </div>
 
                 <div>
@@ -584,6 +584,12 @@ async def interactive_playground():
                                 if (line.startsWith('data: ') && !line.includes('[DONE]')) {
                                     try {
                                         const parsed = JSON.parse(line.replace('data: ', ''));
+                                        if (parsed.error) {
+                                            const errStr = typeof parsed.error === 'object' ? JSON.stringify(parsed.error) : parsed.error;
+                                            botBox.innerHTML = `<span class="text-rose-400 font-mono text-xs">⚠️ Upstream Error: ${errStr}</span>`;
+                                            fullText = errStr;
+                                            break;
+                                        }
                                         const content = parsed.choices[0]?.delta?.content || '';
                                         fullText += content;
                                         botBox.innerText = fullText;
@@ -699,6 +705,7 @@ async def interactive_playground():
         .replace("__FALLBACK_BANNER__", fallback_banner)
         .replace("__ENGINE_SIDEBAR__", engine_sidebar)
         .replace("__DEFAULT_DEV_KEY__", default_dev_key)
+        .replace("__DEFAULT_MODEL__", get_active_provider_info().get("default_model", "gemini-2.5-flash"))
     )
 
 
