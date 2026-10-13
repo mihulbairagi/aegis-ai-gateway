@@ -546,8 +546,7 @@ async def interactive_playground():
                     model: model,
                     messages: [{ role: 'user', content: prompt }],
                     temperature: temperature,
-                    stream: stream,
-                    similarity_threshold: threshold
+                    stream: stream
                 };
 
                 const t0 = performance.now();

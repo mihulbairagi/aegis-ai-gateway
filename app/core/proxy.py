@@ -39,6 +39,7 @@ class UpstreamProxy:
         if is_live and route == "primary":
             try:
                 payload = request.model_dump(exclude_unset=True)
+                payload.pop("similarity_threshold", None)
                 if not payload.get("model") or (
                     payload.get("model", "").startswith("gpt-")
                     and "generativelanguage.googleapis.com" in active["url"]
@@ -88,6 +89,7 @@ class UpstreamProxy:
             try:
                 payload = request.model_dump(exclude_unset=True)
                 payload["stream"] = True
+                payload.pop("similarity_threshold", None)
                 if not payload.get("model") or (
                     payload.get("model", "").startswith("gpt-")
                     and "generativelanguage.googleapis.com" in active["url"]
