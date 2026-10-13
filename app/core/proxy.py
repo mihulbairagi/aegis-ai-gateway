@@ -42,7 +42,7 @@ class UpstreamProxy:
                 payload.pop("similarity_threshold", None)
                 if not payload.get("model") or (
                     payload.get("model", "").startswith("gpt-")
-                    and "generativelanguage.googleapis.com" in active["url"]
+                    and ("generativelanguage.googleapis.com" in active["url"] or "groq.com" in active["url"])
                 ):
                     payload["model"] = active["default_model"]
 
@@ -92,7 +92,7 @@ class UpstreamProxy:
                 payload.pop("similarity_threshold", None)
                 if not payload.get("model") or (
                     payload.get("model", "").startswith("gpt-")
-                    and "generativelanguage.googleapis.com" in active["url"]
+                    and ("generativelanguage.googleapis.com" in active["url"] or "groq.com" in active["url"])
                 ):
                     payload["model"] = active["default_model"]
 
